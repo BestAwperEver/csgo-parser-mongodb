@@ -184,17 +184,17 @@ func close_connection_to_mongo(client *mongo.Client) {
 }
 
 type Tick struct {
-	TickNumber	int						`bson:"TickNumber"`
-	Positions	map[string]r3.Vector	`bson:"Positions"`
-	NadesPositions []NadeInfo			`bson:"NadesPositions"`
+	TickNumber	int                    `bson:"TickNumber"`
+	Positions	map[string]r3.Vector    `bson:"Positions"`
+	NadesPositions []GrenadePositionInfo `bson:"NadesPositions"`
 }
 
-type NadeInfo struct {
+type GrenadePositionInfo struct {
 	UniqueID	int64		`bson:"UniqueID"`
 	Position	r3.Vector	`bson:"Position"`
 }
 
-type PlayerInfo struct {
+type PlayerMovementInfo struct {
 	SteamID		int64		`bson:"SteamID"`
 	Position	r3.Vector	`bson:"Position"`
 	ViewX		float32		`bson:"ViewX"`
@@ -205,6 +205,87 @@ type PlayerStaticInfo struct {
 	SteamID		int64	`bson:"SteamID"`
 	Name		string	`bson:"Name"`
 	EntityID	int		`bson:"EntityID"`
+}
+
+type AdditionalPlayerInfo struct {
+	Score	int	`bson:"Score"`
+	Assists	int	`bson:"Assists"`
+	Deaths	int	`bson:"Deaths"`
+	Kills	int	`bson:"Kills"`
+	MVPs	int	`bson:"MVPs"`
+}
+
+func NewAdditionalPlayerInfo(info *common.AdditionalPlayerInformation) AdditionalPlayerInfo {
+	return AdditionalPlayerInfo{
+		info.Score,
+		info.Assists,
+		info.Deaths,
+		info.Kills,
+		info.MVPs,
+	}
+}
+
+type PlayerStateInfo struct {
+	SteamID					int64					`bson:"SteamID"`
+	Team					common.Team				`bson:"Team"`
+	FlashDuration			float32					`bson:"FlashDuration"`
+	ActiveWeaponID			int64					`bson:"ActiveWeaponID"`
+	AmmoLeft				[32]int					`bson:"AmmoLeft"`
+	Armor					int						`bson:"Armor"`
+	CurrentEquipmentValue	int						`bson:"CurrentEquipmentValue"`
+	HasDefuseKit			bool					`bson:"HasDefuseKit"`
+	HasBomb					bool					`bson:"HasBomb"`
+	HasHelmet				bool					`bson:"HasHelmet"`
+	Hp						int						`bson:"Hp"`
+	IsBot					bool					`bson:"IsBot"`
+	IsConnected				bool					`bson:"IsConnected"`
+	IsDefusing				bool					`bson:"IsDefusing"`
+	IsDucking				bool					`bson:"IsDucking"`
+	IsAlive					bool					`bson:"IsAlive"`
+	IsBlinded				bool					`bson:"IsBlinded"`
+	Money					int						`bson:"Money"`
+	LastAlivePosition		r3.Vector				`bson:"LastAlivePosition"`
+	Inventory				[]EquipmentInfo			`bson:"Inventory"`
+	AdditionalInfo			AdditionalPlayerInfo	`bson:"AdditionalInfo"`
+}
+
+func NewPlayerStateInfo(p *common.Player) PlayerStateInfo {
+	PSI := PlayerStateInfo{
+		-1,
+		p.Team,
+		p.FlashDuration,
+		-1,
+		p.AmmoLeft,
+		p.Armor,
+		p.CurrentEquipmentValue,
+		p.HasDefuseKit,
+		false,
+		p.HasHelmet,
+		p.Hp,
+		p.IsBot,
+		p.IsConnected,
+		p.IsDefusing,
+		p.IsDucking,
+		p.IsAlive(),
+		p.IsBlinded(),
+		p.Money,
+		p.LastAlivePosition,
+		make([]EquipmentInfo, 0, 7),
+		NewAdditionalPlayerInfo(p.AdditionalPlayerInformation),
+	}
+	if p.ActiveWeapon() != nil {
+		PSI.ActiveWeaponID = p.ActiveWeapon().UniqueID()
+	}
+	if PSI.IsBot == false {
+		PSI.SteamID = p.SteamID
+	}
+	for _, Equip := range p.Weapons() {
+		PSI.Inventory = append(PSI.Inventory, NewEquipmentInfo(*Equip))
+		if Equip.Weapon == common.EqBomb {
+			PSI.HasBomb = true
+		}
+	}
+	return PSI
 }
 
 func NewPlayerStaticInfo(player common.Player) PlayerStaticInfo {
@@ -223,6 +304,31 @@ type EquipmentInfo struct {
 	AmmoInMagazine	int 					`bson:"AmmoInMagazine"`
 	AmmoReserve		int 					`bson:"AmmoReserve"`
 	ZoomLevel		int 					`bson:"ZoomLevel"`
+}
+
+func NewEquipmentInfo(Equip common.Equipment) EquipmentInfo {
+	EI := EquipmentInfo{
+		Equip.UniqueID(),
+		Equip.Weapon,
+		-1,
+		//Equip.AmmoType,
+		Equip.AmmoInMagazine,
+		0,
+		Equip.ZoomLevel,
+	}
+	if Equip.Owner != nil {
+		EI.OwnerID = Equip.Owner.SteamID
+	}
+	if Equip.AmmoReserve != 0 {
+		EI.AmmoReserve = Equip.AmmoReserve
+	}
+
+	return EI
+}
+
+type GameStateInfo struct {
+	FrameNumber	int					`bson:"FrameNumber"`
+	Players		[]PlayerStateInfo	`bson:"Players"`
 }
 
 type TeamStateInfo struct {
@@ -276,61 +382,63 @@ func getMap(event interface{}) map[string]interface{} {
 	if reflectedEvent.Kind() != reflect.Struct {
 		panic("getMap received a non-struct object")
 	}
-
+	if reflectedEvent.NumField() == 0 {
+		return nil
+	}
 	for i := 0; i < reflectedEvent.NumField(); i++ {
-		if field := reflectedEvent.Field(i); field.Kind() != reflect.Ptr {
-			if field.CanInterface() {
+		if field := reflectedEvent.Field(i); field.CanInterface() {
+			switch field.Kind() {
+			case reflect.Ptr:
+				if field.IsNil() == false {
+					switch field := reflect.Indirect(field); field.Type().Name() {
+					//default:
+					//	data[reflectedEvent.Type().Field(i).Name] = reflectedEvent.Field(i).Interface()
+					case "Player":
+						P := field.Interface().(common.Player)
+						resultMap[reflectedEvent.Type().Field(i).Name] = P.SteamID
+					case "GrenadeProjectile":
+						GP := field.Interface().(common.GrenadeProjectile)
+						if _, ok := EquipmentElements[GP.UniqueID()]; !ok {
+							EquipmentElements[GP.UniqueID()] = NewEquipmentElementStaticInfo(GP)
+						}
+						resultMap[reflectedEvent.Type().Field(i).Name] = GP.UniqueID()
+					case "Equipment":
+						Equip := field.Interface().(common.Equipment)
+						EI := NewEquipmentInfo(Equip)
+						//EI := getMap(Equip)
+						resultMap[reflectedEvent.Type().Field(i).Name] = EI
+					case "TeamState":
+						TS := field.Interface().(common.TeamState)
+						resultMap[reflectedEvent.Type().Field(i).Name] = TeamStateInfo{
+							TS.ID,
+							TS.Score,
+							TS.ClanName,
+							TS.Flag,
+						}
+					case "Inferno":
+						INF := field.Interface().(common.Inferno)
+						resultMap[reflectedEvent.Type().Field(i).Name] = INF.UniqueID()
+					case "BombEvent":
+						BE := field.Interface().(events.BombEvent)
+						resultMap["Player"] = BE.Player.SteamID
+						resultMap["Site"] = BE.Site
+					}
+				} else {
+					resultMap[reflectedEvent.Type().Field(i).Name] = -1
+				}
+			case reflect.Struct:
+				resultMap[reflectedEvent.Type().Field(i).Name] = getMap(field.Interface())
+			default:
 				resultMap[reflectedEvent.Type().Field(i).Name] = field.Interface()
 			}
-		} else if field.CanInterface() {
-			if field.IsNil() == false {
-				switch field := reflect.Indirect(field); field.Type().Name() {
-				//default:
-				//	data[reflectedEvent.Type().Field(i).Name] = reflectedEvent.Field(i).Interface()
-				case "Player":
-					P := field.Interface().(common.Player)
-					resultMap[reflectedEvent.Type().Field(i).Name] = P.SteamID
-				case "GrenadeProjectile":
-					GP := field.Interface().(common.GrenadeProjectile)
-					if _, ok := EquipmentElements[GP.UniqueID()]; !ok {
-						EquipmentElements[GP.UniqueID()] = NewEquipmentElementStaticInfo(GP)
-					}
-					resultMap[reflectedEvent.Type().Field(i).Name] = GP.UniqueID()
-				case "Equipment":
-					Equip := field.Interface().(common.Equipment)
-					EI := EquipmentInfo{
-						Equip.UniqueID(),
-						Equip.Weapon,
-						-1,
-						//Equip.AmmoType,
-						Equip.AmmoInMagazine,
-						0,
-						Equip.ZoomLevel,
-					}
-					if Equip.Owner != nil {
-						EI.OwnerID = Equip.Owner.SteamID
-					}
-					if Equip.AmmoReserve != 0 {
-						EI.AmmoReserve = Equip.AmmoReserve
-					}
-					//EI := getMap(Equip)
-					resultMap[reflectedEvent.Type().Field(i).Name] = EI
-				case "TeamState":
-					TS := field.Interface().(common.TeamState)
-					resultMap[reflectedEvent.Type().Field(i).Name] = TeamStateInfo{
-						TS.ID,
-						TS.Score,
-						TS.ClanName,
-						TS.Flag,
-					}
-				case "Inferno":
-					INF := field.Interface().(common.Inferno)
-					resultMap[reflectedEvent.Type().Field(i).Name] = INF.UniqueID()
-				}
-			} else {
-				resultMap[reflectedEvent.Type().Field(i).Name] = -1
-			}
 		}
+		//if field := reflectedEvent.Field(i); field.Kind() != reflect.Ptr && field.Kind() != reflect.Struct {
+		//	if field.CanInterface() {
+		//		resultMap[reflectedEvent.Type().Field(i).Name] = field.Interface()
+		//	}
+		//} else if field.CanInterface() {
+		//
+		//}
 	}
 
 	return resultMap
@@ -546,7 +654,44 @@ var EvTypeByIndex = map[EvType]string{
 
 var ImplicitlyProcessedEvents = map[EvType]bool{
 	Footstep: true,
+
 	WeaponFire: true,
+	PlayerHurt: true,
+
+	BombDefuseStart: true,
+	BombDefuseAborted: true,
+	BombDefused: true,
+	BombDropped: true,
+	BombExplode: true,
+	BombPickup: true,
+	BombPlantBegin: true,
+	BombPlanted: true,
+
+	GrenadeProjectileBounce: true,
+	GrenadeProjectileDestroy: true,
+
+	HeExplode: true,
+
+	SmokeStart: true,
+	SmokeExpired: true,
+
+	FireGrenadeStart: true,
+	FireGrenadeExpired: true,
+
+	DecoyStart: true,
+	DecoyExpired: true,
+
+	ItemPickup: true,
+	ItemDrop: true,
+	ItemEquip: true,
+
+	PlayerDisconnected: true,
+
+	BotTakenOver: true,
+
+	ScoreUpdated: true,
+
+	TeamSideSwitch: true,
 }
 
 func main2() {
@@ -575,6 +720,7 @@ func main2() {
 	collectionEvents := client.Database(databaseName).Collection("events")
 	collectionPlayers := client.Database(databaseName).Collection("players")
 	collectionEntities := client.Database(databaseName).Collection("entities")
+	collectionGameStates := client.Database(databaseName).Collection("game_states")
 
 	CurrentProjectiles := make(map[int]*common.GrenadeProjectile)
 
@@ -705,8 +851,10 @@ func main2() {
 			var data = EventInfo {
 				p.CurrentFrame(),
 				evType,
-				getMap(reflectedEvent.Interface()),
+				map[string]interface{}{},
 			}
+
+			data.Data = getMap(e)
 
 			_, err := collectionEvents.InsertOne(context.TODO(), data)
 			checkError(err)
@@ -721,15 +869,31 @@ func main2() {
 		if p.GameState().IsWarmupPeriod() || p.GameState().IsMatchStarted() == false {
 			continue
 		}
-		if p.GameState().TotalRoundsPlayed() > 3 {
-			break
+		//if p.GameState().TotalRoundsPlayed() > 3 {
+		//	break
+		//}
+		if p.CurrentFrame() % 30 == 0 {
+			//saving the whole game state
+
+			var data = GameStateInfo {
+				p.CurrentFrame(),
+				make([]PlayerStateInfo, 0, len(p.GameState().Participants().Playing())),
+			}
+
+			for _, p := range p.GameState().Participants().Playing() {
+				data.Players = append(data.Players, NewPlayerStateInfo(p))
+			}
+
+			_, err := collectionGameStates.InsertOne(context.TODO(), data)
+			checkError(err)
 		}
 		if saveTicks {
-			PlayersPos := make([]PlayerInfo, 0, len(p.GameState().Participants().Playing()))
-			NadesPos := make([]NadeInfo, 0, len(p.GameState().GrenadeProjectiles()))
+			PlayersPos := make([]PlayerMovementInfo, 0, len(p.GameState().Participants().Playing()))
+			NadesPos := make([]GrenadePositionInfo, 0, len(p.GameState().GrenadeProjectiles()))
 			CurrentInfernos := make([]InfernoInfo, 0, len(p.GameState().Infernos()))
+			
 			for _, v := range p.GameState().Participants().Playing() {
-				PlayersPos = append(PlayersPos, PlayerInfo{
+				PlayersPos = append(PlayersPos, PlayerMovementInfo{
 					v.SteamID,
 					v.Position,
 					v.ViewDirectionX,
@@ -737,7 +901,7 @@ func main2() {
 				})
 			}
 			for _, v := range p.GameState().GrenadeProjectiles() {
-				NadesPos = append(NadesPos, NadeInfo{
+				NadesPos = append(NadesPos, GrenadePositionInfo{
 					v.UniqueID(),
 					v.Position,
 				})
@@ -751,10 +915,10 @@ func main2() {
 			//tickInfo := Tick{p.CurrentFrame(), PlayersPos, NadesPos}
 			//fmt.Println(tickInfo)
 			_, err := collectionTicks.InsertOne(context.TODO(), struct {
-				FrameNumber      int           `bson:"FrameNumber"`
-				PlayersPositions []PlayerInfo  `bson:"PlayerPositions"`
-				NadesPositions   []NadeInfo    `bson:"GrenadePositions"`
-				CurrentInfernos  []InfernoInfo `bson:"CurrentInfernos"`
+				FrameNumber      int                   `bson:"FrameNumber"`
+				PlayersPositions []PlayerMovementInfo  `bson:"PlayerPositions"`
+				NadesPositions   []GrenadePositionInfo `bson:"GrenadePositions"`
+				CurrentInfernos  []InfernoInfo         `bson:"CurrentInfernos"`
 			}{
 				p.CurrentFrame(),
 				PlayersPos,
