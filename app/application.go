@@ -9,8 +9,6 @@ import (
 	"reflect"
 	"time"
 
-	"github.com/golang/geo/r3"
-
 	dem "github.com/markus-wa/demoinfocs-golang"
 	"github.com/markus-wa/demoinfocs-golang/common"
 	"github.com/markus-wa/demoinfocs-golang/events"
@@ -20,12 +18,15 @@ type Application struct {
 	client		*mongo.Client
 	dbName		string
 	
-	clEvents	string
-	clEntities	string
-	clPlayers	string
-	clFrames	string
-	clHeader	string
-	clGameState	string
+	clEvents		string
+	clEntities		string
+	clPlayers		string
+	clHeader		string
+	clGameState		string
+	clPositions		string
+	clInfernos		string
+	clProjectiles	string
+	clReplays		string
 	
 	collections	map[ClIndex]*mongo.Collection
 	
@@ -46,21 +47,27 @@ func NewApplication(reader io.Reader, client *mongo.Client, dbName string, colle
 		clEvents: collectionNames[ClEvents],
 		clEntities: collectionNames[ClEntities],
 		clPlayers: collectionNames[ClPlayers],
-		clFrames: collectionNames[ClFrames],
 		clHeader: collectionNames[ClHeader],
+		clPositions: collectionNames[ClPositions],
+		clInfernos: collectionNames[ClInfernos],
+		clProjectiles: collectionNames[ClProjectiles],
 		clGameState: collectionNames[ClGameState],
+		clReplays:  collectionNames[ClReplays],
 	}
 }
 
 type ClIndex int
 
 const (
-	ClEvents	ClIndex = 0
-	ClEntities	ClIndex = 1
-	ClPlayers	ClIndex = 2
-	ClFrames	ClIndex = 3
-	ClHeader	ClIndex = 4
-	ClGameState ClIndex = 5
+	ClEvents		ClIndex = 0
+	ClEntities		ClIndex = 1
+	ClPlayers		ClIndex = 2
+	ClPositions		ClIndex = 3
+	ClHeader		ClIndex = 4
+	ClGameState		ClIndex = 5
+	ClInfernos		ClIndex = 6
+	ClProjectiles	ClIndex = 7
+	ClReplays		ClIndex = 8
 )
 
 func (app *Application) Init() {
@@ -72,11 +79,14 @@ func (app *Application) Init() {
 	app.collections = make(map[ClIndex]*mongo.Collection)
 
 	app.collections[ClEvents] = app.client.Database(app.dbName).Collection(app.clEvents)
-	app.collections[ClFrames] = app.client.Database(app.dbName).Collection(app.clFrames)
+	app.collections[ClPositions] = app.client.Database(app.dbName).Collection(app.clPositions)
+	app.collections[ClInfernos] = app.client.Database(app.dbName).Collection(app.clInfernos)
+	app.collections[ClProjectiles] = app.client.Database(app.dbName).Collection(app.clProjectiles)
 	app.collections[ClHeader] = app.client.Database(app.dbName).Collection(app.clHeader)
 	app.collections[ClPlayers] = app.client.Database(app.dbName).Collection(app.clPlayers)
 	app.collections[ClEntities] = app.client.Database(app.dbName).Collection(app.clEntities)
 	app.collections[ClGameState] = app.client.Database(app.dbName).Collection(app.clGameState)
+	app.collections[ClReplays] = app.client.Database("meta_info").Collection(app.clReplays)
 
 	app.parser = dem.NewParser(app.reader)
 }
@@ -249,7 +259,7 @@ func (app *Application) manualHandlerRegistering() {
 
 		type FlashExplodeInfo struct {
 			UniqueID	int64		`bson:"UniqueID"`
-			Position	r3.Vector	`bson:"Position"`
+			Position	Int16Vector3	`bson:"Position"`
 		}
 
 		var data = struct {
@@ -261,7 +271,7 @@ func (app *Application) manualHandlerRegistering() {
 			FlashExplode,
 			FlashExplodeInfo{
 				app.currentProjectiles[e.GrenadeEntityID].UniqueID(),
-				e.Position,
+				NewInt16Vector3(e.Position),
 			},
 		}
 
@@ -320,6 +330,17 @@ func (app *Application) Parse() {
 	_, err =  app.collections[ClHeader].InsertOne(context.TODO(), headerMap)
 	checkError(err)
 
+	if app.dbName != "test" {
+		_, err =  app.collections[ClReplays].InsertOne(context.TODO(), struct {
+			DBname		string
+			Timestamp	time.Time
+		}{
+			app.dbName,
+			time.Now(),
+		})
+		checkError(err)
+	}
+
 	next, err := app.parser.ParseNextFrame()
 	checkError(err)
 
@@ -352,10 +373,14 @@ func (app *Application) Parse() {
 		if app.parser.GameState().IsWarmupPeriod() || app.parser.GameState().IsMatchStarted() == false {
 			continue
 		}
+		//if app.parser.GameState().TotalRoundsPlayed() < 2 {
+		//	continue
+		//}
 		//if app.parser.GameState().TotalRoundsPlayed() > 3 {
 		//	break
 		//}
 		if app.parser.CurrentFrame() % 30 == 0 {
+		//if true {
 			//saving the whole game state
 
 			var data = GameStateInfo{
@@ -378,7 +403,7 @@ func (app *Application) Parse() {
 			for _, v := range app.parser.GameState().Participants().Playing() {
 				playersPos = append(playersPos, PlayerMovementInfo{
 					v.SteamID,
-					v.Position,
+					NewInt16Vector3(v.Position),
 					v.ViewDirectionX,
 					v.ViewDirectionY,
 				})
@@ -386,7 +411,7 @@ func (app *Application) Parse() {
 			for _, v := range app.parser.GameState().GrenadeProjectiles() {
 				grenadesPos = append(grenadesPos, GrenadePositionInfo{
 					v.UniqueID(),
-					v.Position,
+					NewInt16Vector3(v.Position),
 				})
 			}
 			for _, v := range app.parser.GameState().Infernos() {
@@ -395,16 +420,30 @@ func (app *Application) Parse() {
 					v.Active().ConvexHull2D(),
 				})
 			}
-			frameInfo := FramePositions{
-				app.parser.CurrentFrame(),
-				playersPos,
-				grenadesPos,
-				currentInfernos,
+
+			if len(playersPos) > 0 {
+				_, err := app.collections[ClPositions].InsertOne(context.TODO(), FramePositions{
+					app.parser.CurrentFrame(),
+					playersPos,
+				})
+				checkError(err)
 			}
 
-			_, err :=  app.collections[ClFrames].InsertOne(context.TODO(), frameInfo)
+			if len(grenadesPos) > 0 {
+				_, err = app.collections[ClProjectiles].InsertOne(context.TODO(), FrameProjectiles{
+					app.parser.CurrentFrame(),
+					grenadesPos,
+				})
+				checkError(err)
+			}
 
-			checkError(err)
+			if len(currentInfernos) > 0 {
+				_, err = app.collections[ClInfernos].InsertOne(context.TODO(), FrameInfernos{
+					app.parser.CurrentFrame(),
+					currentInfernos,
+				})
+				checkError(err)
+			}
 		}
 	}
 }

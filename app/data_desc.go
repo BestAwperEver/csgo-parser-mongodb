@@ -7,23 +7,44 @@ import (
 )
 
 type FramePositions struct {
-	//FrameNumber			int						`bson:"FrameNumber"`
-	//PlayerPositions		map[string]r3.Vector	`bson:"Positions"`
-	//GrenadesPositions	[]GrenadePositionInfo	`bson:"GrenadesPositions"`
 	FrameNumber       int                   `bson:"FrameNumber"`
 	PlayersPositions  []PlayerMovementInfo  `bson:"PlayerPositions"`
+}
+
+type FrameProjectiles struct {
+	FrameNumber       int                   `bson:"FrameNumber"`
 	GrenadesPositions []GrenadePositionInfo `bson:"GrenadePositions"`
+}
+
+type FrameInfernos struct {
+	FrameNumber       int                   `bson:"FrameNumber"`
 	CurrentInfernos   []InfernoInfo         `bson:"CurrentInfernos"`
+}
+
+type Int16Vector3 struct {
+	X, Y, Z	int16
+}
+
+func NewInt16Vector3(v r3.Vector) Int16Vector3 {
+	return Int16Vector3{int16(v.X), int16(v.Y), int16(v.Z)}
+}
+
+type Int16Vector2 struct {
+	X, Y	int16
+}
+
+func NewInt16Vector2(v r2.Point) Int16Vector2 {
+	return Int16Vector2{int16(v.X), int16(v.Y)}
 }
 
 type GrenadePositionInfo struct {
 	UniqueID	int64		`bson:"UniqueID"`
-	Position	r3.Vector	`bson:"Position"`
+	Position	Int16Vector3	`bson:"Position"`
 }
 
 type PlayerMovementInfo struct {
 	SteamID		int64		`bson:"SteamID"`
-	Position	r3.Vector	`bson:"Position"`
+	Position	Int16Vector3	`bson:"Position"`
 	ViewX		float32		`bson:"ViewX"`
 	ViewY		float32		`bson:"ViewY"`
 }
@@ -71,7 +92,7 @@ type PlayerStateInfo struct {
 	IsAlive					bool					`bson:"IsAlive"`
 	IsBlinded				bool					`bson:"IsBlinded"`
 	Money					int						`bson:"Money"`
-	LastAlivePosition		r3.Vector				`bson:"LastAlivePosition"`
+	LastAlivePosition		Int16Vector3				`bson:"LastAlivePosition"`
 	Inventory				[]EquipmentInfo			`bson:"Inventory"`
 	AdditionalInfo			AdditionalPlayerInfo	`bson:"AdditionalInfo"`
 }
@@ -96,7 +117,7 @@ func NewPlayerStateInfo(p *common.Player) PlayerStateInfo {
 		p.IsAlive(),
 		p.IsBlinded(),
 		p.Money,
-		p.LastAlivePosition,
+		NewInt16Vector3(p.LastAlivePosition),
 		make([]EquipmentInfo, 0, 7),
 		NewAdditionalPlayerInfo(p.AdditionalPlayerInformation),
 	}
