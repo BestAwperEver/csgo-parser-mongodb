@@ -42,8 +42,22 @@ type Application struct {
 	equipmentElements	map[int64]EquipmentElementStaticInfo
 	playersLoaded		bool
 	
-	implicitlyProcessedEvents	map[int64]EquipmentElementStaticInfo
+	implicitlyProcessedEvents	map[EvType]bool
 }
+
+// collections' indices
+type ClIndex int
+const (
+	ClEvents		ClIndex = 0
+	ClEntities		ClIndex = 1
+	ClPlayers		ClIndex = 2
+	ClPositions		ClIndex = 3
+	ClHeader		ClIndex = 4
+	ClGameState		ClIndex = 5
+	ClInfernos		ClIndex = 6
+	ClProjectiles	ClIndex = 7
+	ClReplays		ClIndex = 8
+)
 
 func NewApplication(reader io.Reader, client *mongo.Client, dbName string, collectionNames map[ClIndex]string) Application {
 	return Application{
@@ -62,20 +76,6 @@ func NewApplication(reader io.Reader, client *mongo.Client, dbName string, colle
 		//clReplays:  collectionNames[ClReplays],
 	}
 }
-
-type ClIndex int
-
-const (
-	ClEvents		ClIndex = 0
-	ClEntities		ClIndex = 1
-	ClPlayers		ClIndex = 2
-	ClPositions		ClIndex = 3
-	ClHeader		ClIndex = 4
-	ClGameState		ClIndex = 5
-	ClInfernos		ClIndex = 6
-	ClProjectiles	ClIndex = 7
-	ClReplays		ClIndex = 8
-)
 
 func (app *Application) Init() {
 	err := app.client.Ping(context.TODO(), readpref.Primary())
@@ -109,6 +109,49 @@ func (app *Application) Init() {
 	app.parser = dem.NewParser(app.reader)
 
 	app.playersLoaded = false
+
+	// events that are getting processed without dedicated handlers
+	app.implicitlyProcessedEvents = map[EvType]bool {
+		Footstep: true,
+
+		WeaponFire: true,
+		PlayerHurt: true,
+
+		BombDefuseStart:   true,
+		BombDefuseAborted: true,
+		BombDefused:       true,
+		BombDropped:       true,
+		BombExplode:       true,
+		BombPickup:        true,
+		BombPlantBegin:    true,
+		BombPlanted:       true,
+
+		GrenadeProjectileBounce:  true,
+		GrenadeProjectileDestroy: true,
+
+		HeExplode: true,
+
+		SmokeStart:   true,
+		SmokeExpired: true,
+
+		FireGrenadeStart:   true,
+		FireGrenadeExpired: true,
+
+		DecoyStart:   true,
+		DecoyExpired: true,
+
+		ItemPickup: true,
+		ItemDrop:   true,
+		ItemEquip:  true,
+
+		PlayerDisconnected: true,
+
+		BotTakenOver: true,
+
+		ScoreUpdated: true,
+
+		TeamSideSwitch: true,
+	}
 }
 
 // makes a map from event for persistent saving
@@ -178,48 +221,6 @@ func (app *Application) getMap(event interface{}) map[string]interface{} {
 	}
 
 	return resultMap
-}
-// events that are getting processed without dedicated handlers
-var ImplicitlyProcessedEvents = map[EvType]bool{
-	Footstep: true,
-
-	WeaponFire: true,
-	PlayerHurt: true,
-
-	BombDefuseStart:   true,
-	BombDefuseAborted: true,
-	BombDefused:       true,
-	BombDropped:       true,
-	BombExplode:       true,
-	BombPickup:        true,
-	BombPlantBegin:    true,
-	BombPlanted:       true,
-
-	GrenadeProjectileBounce:  true,
-	GrenadeProjectileDestroy: true,
-
-	HeExplode: true,
-
-	SmokeStart:   true,
-	SmokeExpired: true,
-
-	FireGrenadeStart:   true,
-	FireGrenadeExpired: true,
-
-	DecoyStart:   true,
-	DecoyExpired: true,
-
-	ItemPickup: true,
-	ItemDrop:   true,
-	ItemEquip:  true,
-
-	PlayerDisconnected: true,
-
-	BotTakenOver: true,
-
-	ScoreUpdated: true,
-
-	TeamSideSwitch: true,
 }
 
 func (app *Application) manualHandlerRegistering() {
@@ -397,7 +398,7 @@ func (app *Application) Parse() {
 		}
 		reflectedEvent := reflect.ValueOf(e)
 
-		if evType := EvTypeIndex[reflectedEvent.Type().Name()]; ImplicitlyProcessedEvents[evType] {
+		if evType := EvTypeIndex[reflectedEvent.Type().Name()]; app.implicitlyProcessedEvents[evType] {
 			var data = EventInfo {
 				app.parser.CurrentFrame(),
 				evType,
