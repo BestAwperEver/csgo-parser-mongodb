@@ -21,10 +21,13 @@ var clNames = map[app.ClIndex]string {
 
 func main() {
 	var pathToDemoFile, mongoUri, dbName string
+	var gameStateFreq, positionsFreq int
 
 	flag.StringVar(&pathToDemoFile,"dpath", "none", "path to the .dem file to parse")
 	flag.StringVar(&mongoUri, "uri", "localhost:27017", "mongodb connection URI")
 	flag.StringVar(&dbName, "dbname", "test", "database name for parsed data")
+	flag.IntVar(&gameStateFreq, "gamestate", 30, "save a full game state every _ frames")
+	flag.IntVar(&positionsFreq, "positions", 1, "save players' and grenades' positions every _ frames")
 
 	flag.Parse()
 
@@ -41,7 +44,7 @@ func main() {
 	client := connect_to_mongo(mongoUri, 2*time.Second)
 	defer close_connection_to_mongo(client)
 
-	application := app.NewApplication(f, client, dbName, clNames)
+	application := app.NewApplication(f, client, dbName, clNames, false, gameStateFreq, positionsFreq)
 	application.Init()
 	application.Parse()
 }

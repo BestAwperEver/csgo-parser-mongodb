@@ -43,10 +43,10 @@ type GrenadePositionInfo struct {
 }
 
 type PlayerMovementInfo struct {
-	SteamID		int64		`bson:"SteamID"`
+	SteamID		int64			`bson:"SteamID"`
 	Position	Int16Vector3	`bson:"Position"`
-	ViewX		float32		`bson:"ViewX"`
-	ViewY		float32		`bson:"ViewY"`
+	ViewX		int16			`bson:"ViewX"`
+	ViewY		int16			`bson:"ViewY"`
 }
 
 type PlayerStaticInfo struct {

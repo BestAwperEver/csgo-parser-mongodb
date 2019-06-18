@@ -15,10 +15,10 @@ import (
 )
 
 type Application struct {
-	client		*mongo.Client
-	dbName		string
-	
-	collectionNames	map[ClIndex]string
+	client *mongo.Client
+	dbName string
+
+	collectionNames map[ClIndex]string
 	//clEvents		string
 	//clEntities		string
 	//clPlayers		string
@@ -28,21 +28,27 @@ type Application struct {
 	//clInfernos		string
 	//clProjectiles	string
 	//clReplays		string
-	
-	//bulk operations
-	bulkInserts		map[ClIndex][]mongo.WriteModel
-	collectionsForBulkInserting	[]ClIndex
-	
-	collections	map[ClIndex]*mongo.Collection
-	
-	reader		io.Reader
-	parser		*dem.Parser
 
-	currentProjectiles	map[int]*common.GrenadeProjectile
-	equipmentElements	map[int64]EquipmentElementStaticInfo
-	playersLoaded		bool
-	
-	implicitlyProcessedEvents	map[EvType]bool
+	//bulk operations
+	bulkInserts                 map[ClIndex][]mongo.WriteModel
+	collectionsForBulkInserting []ClIndex
+
+	collections map[ClIndex]*mongo.Collection
+
+	reader io.Reader
+	parser *dem.Parser
+
+	currentProjectiles map[int]*common.GrenadeProjectile
+	equipmentElements  map[int64]EquipmentElementStaticInfo
+	playersLoaded      bool
+	saveGameStateFrameDenominator int
+	savePositionsFrameDenominator int
+
+	implicitlyProcessedEvents map[EvType]bool
+
+	// for calculating deltas
+	savePositionsAsDeltas         bool
+	playersLastPositions          map[int64]PlayerMovementInfo
 }
 
 // collections' indices
@@ -59,12 +65,22 @@ const (
 	ClReplays		ClIndex = 8
 )
 
-func NewApplication(reader io.Reader, client *mongo.Client, dbName string, collectionNames map[ClIndex]string) Application {
+func NewApplication(
+	reader io.Reader,
+	client *mongo.Client,
+	dbName string,
+	collectionNames map[ClIndex]string,
+	savePositionsAsDeltas bool,
+	gameStateFreq int,
+	positionsFreq int) Application {
 	return Application{
-		reader: reader,
-		client: client,
-		dbName: dbName,
-		collectionNames: collectionNames,
+		reader:                reader,
+		client:                client,
+		dbName:                dbName,
+		collectionNames:       collectionNames,
+		savePositionsAsDeltas: savePositionsAsDeltas,
+		saveGameStateFrameDenominator: gameStateFreq,
+		savePositionsFrameDenominator: positionsFreq,
 		//clEvents: collectionNames[ClEvents],
 		//clEntities: collectionNames[ClEntities],
 		//clPlayers: collectionNames[ClPlayers],
@@ -109,6 +125,7 @@ func (app *Application) Init() {
 	app.parser = dem.NewParser(app.reader)
 
 	app.playersLoaded = false
+	app.playersLastPositions = make(map[int64]PlayerMovementInfo)
 
 	// events that are getting processed without dedicated handlers
 	app.implicitlyProcessedEvents = map[EvType]bool {
@@ -415,8 +432,6 @@ func (app *Application) Parse() {
 		}
 	})
 
-	var saveTicks = true
-
 	for next {
 		next, err = app.parser.ParseNextFrame()
 		checkError(err)
@@ -431,7 +446,7 @@ func (app *Application) Parse() {
 		//}
 
 		//saving the whole game state
-		if app.parser.CurrentFrame() % 30 == 0 {
+		if app.parser.CurrentFrame() % app.saveGameStateFrameDenominator == 0 {
 		//if true {
 			//saving the whole game state
 
@@ -469,18 +484,25 @@ func (app *Application) Parse() {
 			//_, err :=  app.collections[ClGameState].InsertOne(context.TODO(), data)
 			//checkError(err)
 		}
-		if saveTicks {
+		if app.parser.CurrentFrame() % app.savePositionsFrameDenominator == 0 {
+
 			playersPos := make([]PlayerMovementInfo, 0, len(app.parser.GameState().Participants().Playing()))
 			grenadesPos := make([]GrenadePositionInfo, 0, len(app.parser.GameState().GrenadeProjectiles()))
 			currentInfernos := make([]InfernoInfo, 0, len(app.parser.GameState().Infernos()))
 			
 			for _, v := range app.parser.GameState().Participants().Playing() {
-				playersPos = append(playersPos, PlayerMovementInfo{
-					v.SteamID,
-					NewInt16Vector3(v.Position),
-					v.ViewDirectionX,
-					v.ViewDirectionY,
-				})
+				var data PlayerMovementInfo
+				if app.savePositionsAsDeltas {
+					data = app.calculateDelta(v)
+				} else {
+					data = PlayerMovementInfo{
+						v.SteamID,
+						NewInt16Vector3(v.Position),
+						int16(v.ViewDirectionX),
+						int16(v.ViewDirectionY),
+					}
+				}
+				playersPos = append(playersPos, data)
 			}
 			for _, v := range app.parser.GameState().GrenadeProjectiles() {
 				grenadesPos = append(grenadesPos, GrenadePositionInfo{
@@ -543,6 +565,30 @@ func (app *Application) Parse() {
 		checkError(err)
 	}
 
+}
+
+func (app *Application) calculateDelta(player *common.Player) PlayerMovementInfo {
+	PMI := PlayerMovementInfo{
+		SteamID: player.SteamID,
+	}
+	if _, ok := app.playersLastPositions[PMI.SteamID]; !ok {
+		app.playersLastPositions[PMI.SteamID] = PlayerMovementInfo{
+			SteamID:	player.SteamID,
+			Position:	NewInt16Vector3(player.Position),
+			ViewX:		int16(player.ViewDirectionX),
+			ViewY:		int16(player.ViewDirectionY),
+		}
+		return app.playersLastPositions[PMI.SteamID]
+	} else {
+		PMI.Position = Int16Vector3{
+			int16(player.Position.X) - app.playersLastPositions[player.SteamID].Position.X,
+			int16(player.Position.Y) - app.playersLastPositions[player.SteamID].Position.Y,
+			int16(player.Position.X) - app.playersLastPositions[player.SteamID].Position.Z,
+		}
+		PMI.ViewX = int16(player.ViewDirectionX) - app.playersLastPositions[player.SteamID].ViewX
+		PMI.ViewY = int16(player.ViewDirectionY) - app.playersLastPositions[player.SteamID].ViewY
+	}
+	return PMI
 }
 
 func checkError(err error) {
