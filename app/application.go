@@ -18,15 +18,20 @@ type Application struct {
 	client		*mongo.Client
 	dbName		string
 	
-	clEvents		string
-	clEntities		string
-	clPlayers		string
-	clHeader		string
-	clGameState		string
-	clPositions		string
-	clInfernos		string
-	clProjectiles	string
-	clReplays		string
+	collectionNames	map[ClIndex]string
+	//clEvents		string
+	//clEntities		string
+	//clPlayers		string
+	//clHeader		string
+	//clGameState		string
+	//clPositions		string
+	//clInfernos		string
+	//clProjectiles	string
+	//clReplays		string
+	
+	//bulk operations
+	bulkInserts		map[ClIndex][]mongo.WriteModel
+	collectionsForBulkInserting	[]ClIndex
 	
 	collections	map[ClIndex]*mongo.Collection
 	
@@ -35,6 +40,7 @@ type Application struct {
 
 	currentProjectiles	map[int]*common.GrenadeProjectile
 	equipmentElements	map[int64]EquipmentElementStaticInfo
+	playersLoaded		bool
 	
 	implicitlyProcessedEvents	map[int64]EquipmentElementStaticInfo
 }
@@ -44,15 +50,16 @@ func NewApplication(reader io.Reader, client *mongo.Client, dbName string, colle
 		reader: reader,
 		client: client,
 		dbName: dbName,
-		clEvents: collectionNames[ClEvents],
-		clEntities: collectionNames[ClEntities],
-		clPlayers: collectionNames[ClPlayers],
-		clHeader: collectionNames[ClHeader],
-		clPositions: collectionNames[ClPositions],
-		clInfernos: collectionNames[ClInfernos],
-		clProjectiles: collectionNames[ClProjectiles],
-		clGameState: collectionNames[ClGameState],
-		clReplays:  collectionNames[ClReplays],
+		collectionNames: collectionNames,
+		//clEvents: collectionNames[ClEvents],
+		//clEntities: collectionNames[ClEntities],
+		//clPlayers: collectionNames[ClPlayers],
+		//clHeader: collectionNames[ClHeader],
+		//clPositions: collectionNames[ClPositions],
+		//clInfernos: collectionNames[ClInfernos],
+		//clProjectiles: collectionNames[ClProjectiles],
+		//clGameState: collectionNames[ClGameState],
+		//clReplays:  collectionNames[ClReplays],
 	}
 }
 
@@ -78,17 +85,30 @@ func (app *Application) Init() {
 	app.currentProjectiles = make(map[int]*common.GrenadeProjectile)
 	app.collections = make(map[ClIndex]*mongo.Collection)
 
-	app.collections[ClEvents] = app.client.Database(app.dbName).Collection(app.clEvents)
-	app.collections[ClPositions] = app.client.Database(app.dbName).Collection(app.clPositions)
-	app.collections[ClInfernos] = app.client.Database(app.dbName).Collection(app.clInfernos)
-	app.collections[ClProjectiles] = app.client.Database(app.dbName).Collection(app.clProjectiles)
-	app.collections[ClHeader] = app.client.Database(app.dbName).Collection(app.clHeader)
-	app.collections[ClPlayers] = app.client.Database(app.dbName).Collection(app.clPlayers)
-	app.collections[ClEntities] = app.client.Database(app.dbName).Collection(app.clEntities)
-	app.collections[ClGameState] = app.client.Database(app.dbName).Collection(app.clGameState)
-	app.collections[ClReplays] = app.client.Database("meta_info").Collection(app.clReplays)
+	app.collections[ClEvents] = app.client.Database(app.dbName).Collection(app.collectionNames[ClEvents])
+	app.collections[ClPositions] = app.client.Database(app.dbName).Collection(app.collectionNames[ClPositions])
+	app.collections[ClInfernos] = app.client.Database(app.dbName).Collection(app.collectionNames[ClInfernos])
+	app.collections[ClProjectiles] = app.client.Database(app.dbName).Collection(app.collectionNames[ClProjectiles])
+	app.collections[ClHeader] = app.client.Database(app.dbName).Collection(app.collectionNames[ClHeader])
+	app.collections[ClPlayers] = app.client.Database(app.dbName).Collection(app.collectionNames[ClPlayers])
+	app.collections[ClEntities] = app.client.Database(app.dbName).Collection(app.collectionNames[ClEntities])
+	app.collections[ClGameState] = app.client.Database(app.dbName).Collection(app.collectionNames[ClGameState])
+	app.collections[ClReplays] = app.client.Database("meta_info").Collection(app.collectionNames[ClReplays])
+
+	app.collectionsForBulkInserting = []ClIndex {
+		ClEvents,
+		ClPositions,
+		ClInfernos,
+		ClProjectiles,
+		ClPlayers,
+		ClEntities,
+		ClGameState,
+	}
+	app.bulkInserts = make(map[ClIndex][]mongo.WriteModel)
 
 	app.parser = dem.NewParser(app.reader)
+
+	app.playersLoaded = false
 }
 
 // makes a map from event for persistent saving
@@ -203,6 +223,7 @@ var ImplicitlyProcessedEvents = map[EvType]bool{
 }
 
 func (app *Application) manualHandlerRegistering() {
+
 	app.parser.RegisterEventHandler(func(e events.GrenadeProjectileThrow) {
 		app.currentProjectiles[e.Projectile.EntityID] = e.Projectile
 		app.equipmentElements[e.Projectile.UniqueID()] = NewEquipmentElementStaticInfo(*e.Projectile)
@@ -215,31 +236,42 @@ func (app *Application) manualHandlerRegistering() {
 			app.getMap(e),
 		}
 
-		_, err := app.collections[ClEvents].InsertOne(context.TODO(), data)
-		checkError(err)
+		model := mongo.NewInsertOneModel().SetDocument(data)
+		app.bulkInserts[ClEvents] = append(app.bulkInserts[ClEvents], model)
+
+		//_, err := app.collections[ClEvents].InsertOne(context.TODO(), data)
+		//checkError(err)
 	})
 
 	app.parser.RegisterEventHandler(func(e events.RoundEnd) {
 		if app.parser.GameState().TeamTerrorists().Score == 15 && e.Winner == common.TeamTerrorists ||
 			app.parser.GameState().TeamCounterTerrorists().Score == 15 && e.Winner == common.TeamCounterTerrorists ||
 			app.parser.GameState().TotalRoundsPlayed() == 29 {
-			//game is over (works for mm)
+			//game is over (works for mm) TODO: get it working for other match types
 			for _, v := range app.equipmentElements {
-				_, err := app.collections[ClEntities].InsertOne(context.TODO(), v)
-				checkError(err)
+
+				model := mongo.NewInsertOneModel().SetDocument(v)
+				app.bulkInserts[ClEntities] = append(app.bulkInserts[ClEntities], model)
+
+				//_, err := app.collections[ClEntities].InsertOne(context.TODO(), v)
+				//checkError(err)
 			}
 		}
 	})
 
-	app.parser.RegisterEventHandler(func(e events.MatchStartedChanged) {
-		if e.NewIsStarted {
-			for _, player := range app.parser.GameState().Participants().Playing() {
-				_, err := app.collections[ClPlayers].InsertOne(context.TODO(),
-					NewPlayerStaticInfo(*player))
-				checkError(err)
-			}
-		}
-	})
+	//app.parser.RegisterEventHandler(func(e events.MatchStartedChanged) {
+	//	if e.NewIsStarted {
+	//		for _, player := range app.parser.GameState().Participants().Playing() {
+	//
+	//			model := mongo.NewInsertOneModel().SetDocument(NewPlayerStaticInfo(*player))
+	//			app.bulkInserts[ClPlayers] = append(app.bulkInserts[ClPlayers], model)
+	//
+	//			//_, err := app.collections[ClPlayers].InsertOne(context.TODO(),
+	//			//	NewPlayerStaticInfo(*player))
+	//			//checkError(err)
+	//		}
+	//	}
+	//})
 
 	app.parser.RegisterEventHandler(func(e events.RankUpdate) {
 		var data = EventInfo{
@@ -248,8 +280,11 @@ func (app *Application) manualHandlerRegistering() {
 			app.getMap(e),
 		}
 
-		_, err := app.collections[ClEvents].InsertOne(context.TODO(), data)
-		checkError(err)
+		model := mongo.NewInsertOneModel().SetDocument(data)
+		app.bulkInserts[ClEvents] = append(app.bulkInserts[ClEvents], model)
+
+		//_, err := app.collections[ClEvents].InsertOne(context.TODO(), data)
+		//checkError(err)
 	})
 
 	app.parser.RegisterEventHandler(func(e events.FlashExplode) {
@@ -275,8 +310,11 @@ func (app *Application) manualHandlerRegistering() {
 			},
 		}
 
-		_, err := app.collections[ClEvents].InsertOne(context.TODO(), data)
-		checkError(err)
+		model := mongo.NewInsertOneModel().SetDocument(data)
+		app.bulkInserts[ClEvents] = append(app.bulkInserts[ClEvents], model)
+
+		//_, err := app.collections[ClEvents].InsertOne(context.TODO(), data)
+		//checkError(err)
 	})
 
 	app.parser.RegisterEventHandler(func(e events.Kill) {
@@ -290,8 +328,11 @@ func (app *Application) manualHandlerRegistering() {
 			app.getMap(e),
 		}
 
-		_, err := app.collections[ClEvents].InsertOne(context.TODO(), data)
-		checkError(err)
+		model := mongo.NewInsertOneModel().SetDocument(data)
+		app.bulkInserts[ClEvents] = append(app.bulkInserts[ClEvents], model)
+
+		//_, err := app.collections[ClEvents].InsertOne(context.TODO(), data)
+		//checkError(err)
 	})
 
 	app.parser.RegisterEventHandler(func(e events.PlayerFlashed) {
@@ -315,8 +356,11 @@ func (app *Application) manualHandlerRegistering() {
 			},
 		}
 
-		_, err := app.collections[ClEvents].InsertOne(context.TODO(), data)
-		checkError(err)
+		model := mongo.NewInsertOneModel().SetDocument(data)
+		app.bulkInserts[ClEvents] = append(app.bulkInserts[ClEvents], model)
+
+		//_, err := app.collections[ClEvents].InsertOne(context.TODO(), data)
+		//		//checkError(err)
 	})
 }
 
@@ -344,6 +388,8 @@ func (app *Application) Parse() {
 	next, err := app.parser.ParseNextFrame()
 	checkError(err)
 
+	app.manualHandlerRegistering()
+
 	// general handler function
 	app.parser.RegisterEventHandler(func(e interface{}) {
 		if app.parser.GameState().IsWarmupPeriod() {
@@ -360,8 +406,11 @@ func (app *Application) Parse() {
 
 			data.Data = app.getMap(e)
 
-			_, err :=  app.collections[ClEvents].InsertOne(context.TODO(), data)
-			checkError(err)
+			model := mongo.NewInsertOneModel().SetDocument(data)
+			app.bulkInserts[ClEvents] = append(app.bulkInserts[ClEvents], model)
+
+			//_, err :=  app.collections[ClEvents].InsertOne(context.TODO(), data)
+			//checkError(err)
 		}
 	})
 
@@ -379,9 +428,30 @@ func (app *Application) Parse() {
 		//if app.parser.GameState().TotalRoundsPlayed() > 3 {
 		//	break
 		//}
+
+		//saving the whole game state
 		if app.parser.CurrentFrame() % 30 == 0 {
 		//if true {
 			//saving the whole game state
+
+			//saving general player infos
+			if app.playersLoaded == false {
+				allPlayersAreHumans := true
+				for _, player := range app.parser.GameState().Participants().Playing() {
+					if player.IsBot == true {
+						allPlayersAreHumans = false
+						break
+					}
+				}
+				if allPlayersAreHumans {
+					app.playersLoaded = true
+					for _, player := range app.parser.GameState().Participants().Playing() {
+						model := mongo.NewInsertOneModel().SetDocument(NewPlayerStaticInfo(*player))
+						app.bulkInserts[ClPlayers] = append(app.bulkInserts[ClPlayers], model)
+					}
+				}
+			}
+
 
 			var data = GameStateInfo{
 				app.parser.CurrentFrame(),
@@ -392,8 +462,11 @@ func (app *Application) Parse() {
 				data.Players = append(data.Players, NewPlayerStateInfo(p))
 			}
 
-			_, err :=  app.collections[ClGameState].InsertOne(context.TODO(), data)
-			checkError(err)
+			model := mongo.NewInsertOneModel().SetDocument(data)
+			app.bulkInserts[ClGameState] = append(app.bulkInserts[ClGameState], model)
+
+			//_, err :=  app.collections[ClGameState].InsertOne(context.TODO(), data)
+			//checkError(err)
 		}
 		if saveTicks {
 			playersPos := make([]PlayerMovementInfo, 0, len(app.parser.GameState().Participants().Playing()))
@@ -422,30 +495,53 @@ func (app *Application) Parse() {
 			}
 
 			if len(playersPos) > 0 {
-				_, err := app.collections[ClPositions].InsertOne(context.TODO(), FramePositions{
+				data := FramePositions{
 					app.parser.CurrentFrame(),
 					playersPos,
-				})
-				checkError(err)
+				}
+
+				model := mongo.NewInsertOneModel().SetDocument(data)
+				app.bulkInserts[ClPositions] = append(app.bulkInserts[ClPositions], model)
+
+				//_, err := app.collections[ClPositions].InsertOne(context.TODO(), data)
+				//checkError(err)
 			}
 
 			if len(grenadesPos) > 0 {
-				_, err = app.collections[ClProjectiles].InsertOne(context.TODO(), FrameProjectiles{
+				data := FrameProjectiles{
 					app.parser.CurrentFrame(),
 					grenadesPos,
-				})
-				checkError(err)
+				}
+
+				model := mongo.NewInsertOneModel().SetDocument(data)
+				app.bulkInserts[ClProjectiles] = append(app.bulkInserts[ClProjectiles], model)
+
+				//_, err = app.collections[ClProjectiles].InsertOne(context.TODO(), data)
+				//checkError(err)
 			}
 
 			if len(currentInfernos) > 0 {
-				_, err = app.collections[ClInfernos].InsertOne(context.TODO(), FrameInfernos{
+				data := FrameInfernos{
 					app.parser.CurrentFrame(),
 					currentInfernos,
-				})
-				checkError(err)
+				}
+
+				model := mongo.NewInsertOneModel().SetDocument(data)
+				app.bulkInserts[ClInfernos] = append(app.bulkInserts[ClInfernos], model)
+
+				//_, err = app.collections[ClInfernos].InsertOne(context.TODO(), data)
+				//checkError(err)
 			}
 		}
 	}
+
+	for _, collectionIndex := range app.collectionsForBulkInserting {
+		data := app.bulkInserts[collectionIndex]
+		fmt.Printf("Length of %s: %d\n", app.collectionNames[collectionIndex], len(data))
+		_, err := app.collections[collectionIndex].BulkWrite(context.TODO(), data)
+		checkError(err)
+	}
+
 }
 
 func checkError(err error) {
