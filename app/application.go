@@ -2,10 +2,12 @@ package app
 
 import (
 	"context"
+	"csgo-parser-mongodb/util"
 	"fmt"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/readpref"
 	"io"
+	"math"
 	"reflect"
 	"time"
 
@@ -14,55 +16,61 @@ import (
 	"github.com/markus-wa/demoinfocs-golang/events"
 )
 
+var dbgPrint bool
+
+func init() {
+	dbgPrint = false
+}
+
 type Application struct {
 	client *mongo.Client
 	dbName string
 
 	collectionNames map[ClIndex]string
-	//clEvents		string
-	//clEntities		string
-	//clPlayers		string
-	//clHeader		string
-	//clGameState		string
-	//clPositions		string
-	//clInfernos		string
-	//clProjectiles	string
-	//clReplays		string
 
 	//bulk operations
-	bulkInserts                 map[ClIndex][]mongo.WriteModel
-	collectionsForBulkInserting []ClIndex
+	bulkInserts map[ClIndex][]mongo.WriteModel
+
+	collectionsForBulkInserting           []ClIndex
+	collectionsForBulkInsertingEveryRound []ClIndex
 
 	collections map[ClIndex]*mongo.Collection
 
 	reader io.Reader
 	parser *dem.Parser
 
-	currentProjectiles map[int]*common.GrenadeProjectile
-	equipmentElements  map[int64]EquipmentElementStaticInfo
-	playersLoaded      bool
+	currentProjectiles            map[int]*common.GrenadeProjectile
+	equipmentElements             map[int64]EquipmentElementStaticInfo
+	playersLoaded                 bool
 	saveGameStateFrameDenominator int
 	savePositionsFrameDenominator int
+	frameRate                     int
+	originalFramerate             int
 
 	implicitlyProcessedEvents map[EvType]bool
 
 	// for calculating deltas
-	savePositionsAsDeltas         bool
-	playersLastPositions          map[int64]PlayerMovementInfo
+	savePositionsAsDeltas bool
+	playersLastPositions  map[int64]PlayerMovementInfo
+	eliasEncodeDeltas     bool
+
+	grenadesPositionsEncoded []GrenadePositionInfoEncoded
+	playersPositionsInRound  map[int64]*PlayerMovement // had to store pointers because go doesn't allow struct mutation when stored in a map
+	roundNumber              int
 }
 
 // collections' indices
 type ClIndex int
 const (
-	ClEvents		ClIndex = 0
-	ClEntities		ClIndex = 1
-	ClPlayers		ClIndex = 2
-	ClPositions		ClIndex = 3
-	ClHeader		ClIndex = 4
-	ClGameState		ClIndex = 5
-	ClInfernos		ClIndex = 6
-	ClProjectiles	ClIndex = 7
-	ClReplays		ClIndex = 8
+	ClEvents	ClIndex = iota
+	ClEntities
+	ClPlayers
+	ClPositions
+	ClHeader
+	ClGameState
+	ClInfernos
+	ClProjectiles
+	ClReplays
 )
 
 func NewApplication(
@@ -70,26 +78,18 @@ func NewApplication(
 	client *mongo.Client,
 	dbName string,
 	collectionNames map[ClIndex]string,
-	savePositionsAsDeltas bool,
+	eliasEncoding bool,
 	gameStateFreq int,
-	positionsFreq int) Application {
+	frameRate int) Application {
 	return Application{
-		reader:                reader,
-		client:                client,
-		dbName:                dbName,
-		collectionNames:       collectionNames,
-		savePositionsAsDeltas: savePositionsAsDeltas,
-		saveGameStateFrameDenominator: gameStateFreq,
-		savePositionsFrameDenominator: positionsFreq,
-		//clEvents: collectionNames[ClEvents],
-		//clEntities: collectionNames[ClEntities],
-		//clPlayers: collectionNames[ClPlayers],
-		//clHeader: collectionNames[ClHeader],
-		//clPositions: collectionNames[ClPositions],
-		//clInfernos: collectionNames[ClInfernos],
-		//clProjectiles: collectionNames[ClProjectiles],
-		//clGameState: collectionNames[ClGameState],
-		//clReplays:  collectionNames[ClReplays],
+		reader:							reader,
+		client:							client,
+		dbName:							dbName,
+		collectionNames:				collectionNames,
+		savePositionsAsDeltas:        	false, // doesn't help in terms of space saving
+		saveGameStateFrameDenominator:	gameStateFreq,
+		frameRate:                    	frameRate,
+		eliasEncodeDeltas:				eliasEncoding,
 	}
 }
 
@@ -120,12 +120,20 @@ func (app *Application) Init() {
 		ClEntities,
 		ClGameState,
 	}
+	app.collectionsForBulkInsertingEveryRound = []ClIndex {
+		ClEvents,
+		ClPositions,
+		ClInfernos,
+		ClProjectiles,
+		ClGameState,
+	}
 	app.bulkInserts = make(map[ClIndex][]mongo.WriteModel)
 
 	app.parser = dem.NewParser(app.reader)
 
 	app.playersLoaded = false
 	app.playersLastPositions = make(map[int64]PlayerMovementInfo)
+	app.playersPositionsInRound = make(map[int64]*PlayerMovement)
 
 	// events that are getting processed without dedicated handlers
 	app.implicitlyProcessedEvents = map[EvType]bool {
@@ -144,7 +152,7 @@ func (app *Application) Init() {
 		BombPlanted:       true,
 
 		GrenadeProjectileBounce:  true,
-		GrenadeProjectileDestroy: true,
+		GrenadeProjectileDestroy: !app.eliasEncodeDeltas,
 
 		HeExplode: true,
 
@@ -225,7 +233,16 @@ func (app *Application) getMap(event interface{}) map[string]interface{} {
 			case reflect.Struct:
 				resultMap[reflectedEvent.Type().Field(i).Name] = app.getMap(field.Interface())
 			default:
-				resultMap[reflectedEvent.Type().Field(i).Name] = field.Interface()
+				Name := reflectedEvent.Type().Field(i).Name
+				// there is no consistent way of knowing UniqueID by EntityID in this particular case
+				// so let's assume we don't need it :P
+				// in reality, we don't really care about grenade's ID because we just need to know that
+				// particular grenade event happened in some position
+				// all the rest goes to knowing that projectile has been removed from the game
+				// and we actually have another event for that, namely GrenadeProjectileDestroy
+				if Name != "GrenadeEntityID" {
+					resultMap[Name] = field.Interface()
+				}
 			}
 		}
 		//if field := reflectedEvent.Field(i); field.Kind() != reflect.Ptr && field.Kind() != reflect.Struct {
@@ -261,20 +278,48 @@ func (app *Application) manualHandlerRegistering() {
 		//checkError(err)
 	})
 
-	app.parser.RegisterEventHandler(func(e events.RoundEnd) {
-		if app.parser.GameState().TeamTerrorists().Score == 15 && e.Winner == common.TeamTerrorists ||
-			app.parser.GameState().TeamCounterTerrorists().Score == 15 && e.Winner == common.TeamCounterTerrorists ||
-			app.parser.GameState().TotalRoundsPlayed() == 29 {
-			//game is over (works for mm) TODO: get it working for other match types
-			for _, v := range app.equipmentElements {
-
-				model := mongo.NewInsertOneModel().SetDocument(v)
-				app.bulkInserts[ClEntities] = append(app.bulkInserts[ClEntities], model)
-
-				//_, err := app.collections[ClEntities].InsertOne(context.TODO(), v)
-				//checkError(err)
+	app.parser.RegisterEventHandler(func(e events.RoundEndOfficial) {
+		app.roundNumber++
+		//if app.parser.GameState().TeamTerrorists().Score == 15 && e.Winner == common.TeamTerrorists ||
+		//	app.parser.GameState().TeamCounterTerrorists().Score == 15 && e.Winner == common.TeamCounterTerrorists ||
+		//	app.parser.GameState().TotalRoundsPlayed() == 29 {
+		//	//game is over (works for mm) TODO: get it working for other match types
+		//	for _, v := range app.equipmentElements {
+		//
+		//		model := mongo.NewInsertOneModel().SetDocument(v)
+		//		app.bulkInserts[ClEntities] = append(app.bulkInserts[ClEntities], model)
+		//
+		//		//_, err := app.collections[ClEntities].InsertOne(context.TODO(), v)
+		//		//checkError(err)
+		//	}
+		//}
+		if app.eliasEncodeDeltas {
+			data := RoundMovement {
+				app.roundNumber,
+				make([]PlayerMovementInfoEncoded, 0, len(app.playersPositionsInRound)),
 			}
+			for k, v := range app.playersPositionsInRound {
+				data.PlayerMovements = append(data.PlayerMovements, PlayerMovementInfoEncoded {
+					k,
+					util.EliasGammaNegative(util.ArrayToDeltas(v.PositionX)...),
+					util.EliasGammaNegative(util.ArrayToDeltas(v.PositionY)...),
+					util.EliasGammaNegative(util.ArrayToDeltas(v.PositionZ)...),
+					util.EliasGammaNegative(util.ArrayToDeltas(v.ViewX)...),
+					util.EliasGammaNegative(util.ArrayToDeltas(v.ViewY)...),
+				})
+				app.playersPositionsInRound[k].PositionX = app.playersPositionsInRound[k].PositionX[:0]
+				app.playersPositionsInRound[k].PositionY = app.playersPositionsInRound[k].PositionY[:0]
+				app.playersPositionsInRound[k].PositionZ = app.playersPositionsInRound[k].PositionX[:0]
+				app.playersPositionsInRound[k].ViewX = app.playersPositionsInRound[k].PositionX[:0]
+				app.playersPositionsInRound[k].ViewY = app.playersPositionsInRound[k].ViewY[:0]
+			}
+			//app.playersPositionsInRound = make(map[int64]*PlayerMovement)
+			//dataMap := app.getMap(data)
+			model := mongo.NewInsertOneModel().SetDocument(data)
+			app.bulkInserts[ClPositions] = append(app.bulkInserts[ClPositions], model)
 		}
+		fmt.Printf("%d\n", app.roundNumber)
+		app.saveDataToMongo()
 	})
 
 	//app.parser.RegisterEventHandler(func(e events.MatchStartedChanged) {
@@ -290,6 +335,27 @@ func (app *Application) manualHandlerRegistering() {
 	//		}
 	//	}
 	//})
+
+	if app.eliasEncodeDeltas {
+		app.parser.RegisterEventHandler(func(e events.GrenadeProjectileDestroy) {
+			X := make([]int, len(e.Projectile.Trajectory))
+			Y := make([]int, len(e.Projectile.Trajectory))
+			Z := make([]int, len(e.Projectile.Trajectory))
+			for i, v := range e.Projectile.Trajectory {
+				X[i] = int(v.X)
+				Y[i] = int(v.Y)
+				Z[i] = int(v.Z)
+			}
+			data := GrenadePositionInfoEncoded {
+				e.Projectile.UniqueID(),
+				util.EliasGammaNegative(util.ArrayToDeltas(X)...),
+				util.EliasGammaNegative(util.ArrayToDeltas(Y)...),
+				util.EliasGammaNegative(util.ArrayToDeltas(Z)...),
+			}
+			model := mongo.NewInsertOneModel().SetDocument(data)
+			app.bulkInserts[ClProjectiles] = append(app.bulkInserts[ClProjectiles], model)
+		})
+	}
 
 	app.parser.RegisterEventHandler(func(e events.RankUpdate) {
 		var data = EventInfo{
@@ -310,15 +376,10 @@ func (app *Application) manualHandlerRegistering() {
 			return
 		}
 
-		type FlashExplodeInfo struct {
-			UniqueID	int64		`bson:"UniqueID"`
-			Position	Int16Vector3	`bson:"Position"`
-		}
-
 		var data = struct {
-			FrameNumber int              `bson:"FrameNumber"`
-			EventType   EvType       `bson:"EventType"`
-			Data        FlashExplodeInfo `bson:"Data"`
+			FrameNumber int					`bson:"FrameNumber"`
+			EventType   EvType				`bson:"EventType"`
+			Data        FlashExplodeInfo	`bson:"Data"`
 		}{
 			app.parser.CurrentFrame(),
 			FlashExplode,
@@ -388,6 +449,16 @@ func (app *Application) Parse() {
 	checkError(err)
 	headerMap := app.getMap(header)
 	fmt.Println("Header:", headerMap)
+	app.originalFramerate = int(math.Round(float64(header.PlaybackFrames) / header.PlaybackTime.Seconds() / 16) * 16)
+	fmt.Printf("Original demo framerate: %d frames per second.\n", app.originalFramerate)
+	if app.originalFramerate < app.frameRate {
+		app.savePositionsFrameDenominator = 1
+		fmt.Printf("Requested framerate (%d) is greater than original. Setting framerate to %d.\n", app.frameRate, app.originalFramerate)
+	} else {
+		app.savePositionsFrameDenominator = app.originalFramerate / app.frameRate
+		fmt.Printf("Saving players' and grenades' positions every %d frame(s).\n", app.savePositionsFrameDenominator)
+	}
+
 
 	_, err =  app.collections[ClHeader].InsertOne(context.TODO(), headerMap)
 	checkError(err)
@@ -432,6 +503,8 @@ func (app *Application) Parse() {
 		}
 	})
 
+	fmt.Println("Parsing started")
+
 	for next {
 		next, err = app.parser.ParseNextFrame()
 		checkError(err)
@@ -468,7 +541,6 @@ func (app *Application) Parse() {
 				}
 			}
 
-
 			var data = GameStateInfo{
 				app.parser.CurrentFrame(),
 				make([]PlayerStateInfo, 0, len(app.parser.GameState().Participants().Playing())),
@@ -489,27 +561,46 @@ func (app *Application) Parse() {
 			playersPos := make([]PlayerMovementInfo, 0, len(app.parser.GameState().Participants().Playing()))
 			grenadesPos := make([]GrenadePositionInfo, 0, len(app.parser.GameState().GrenadeProjectiles()))
 			currentInfernos := make([]InfernoInfo, 0, len(app.parser.GameState().Infernos()))
-			
+
 			for _, v := range app.parser.GameState().Participants().Playing() {
-				var data PlayerMovementInfo
-				if app.savePositionsAsDeltas {
-					data = app.calculateDelta(v)
-				} else {
-					data = PlayerMovementInfo{
-						v.SteamID,
-						NewInt16Vector3(v.Position),
-						int16(v.ViewDirectionX),
-						int16(v.ViewDirectionY),
+				if v.IsAlive() { // saving only positions of alive players
+					if !app.eliasEncodeDeltas {
+						var data PlayerMovementInfo
+						if app.savePositionsAsDeltas {
+							data = app.calculateDelta(v)
+						} else {
+							data = PlayerMovementInfo{
+								v.SteamID,
+								NewInt16Vector3(v.Position),
+								int16(v.ViewDirectionX),
+								int16(v.ViewDirectionY),
+							}
+						}
+						playersPos = append(playersPos, data)
+					} else {
+						PM, ok := app.playersPositionsInRound[v.SteamID]
+						if !ok {
+							app.playersPositionsInRound[v.SteamID] = &PlayerMovement{}
+							PM = app.playersPositionsInRound[v.SteamID]
+						}
+						PM.PositionX = append(PM.PositionX, int(v.Position.X))
+						PM.PositionY = append(PM.PositionY, int(v.Position.Y))
+						PM.PositionZ = append(PM.PositionZ, int(v.Position.Z))
+						PM.ViewX = append(PM.ViewX, int(v.ViewDirectionX))
+						PM.ViewY = append(PM.ViewY, int(v.ViewDirectionY))
 					}
 				}
-				playersPos = append(playersPos, data)
 			}
-			for _, v := range app.parser.GameState().GrenadeProjectiles() {
-				grenadesPos = append(grenadesPos, GrenadePositionInfo{
-					v.UniqueID(),
-					NewInt16Vector3(v.Position),
-				})
+
+			if !app.eliasEncodeDeltas {
+				for _, v := range app.parser.GameState().GrenadeProjectiles() {
+					grenadesPos = append(grenadesPos, GrenadePositionInfo{
+						v.UniqueID(),
+						NewInt16Vector3(v.Position),
+					})
+				}
 			}
+
 			for _, v := range app.parser.GameState().Infernos() {
 				currentInfernos = append(currentInfernos, InfernoInfo{
 					v.UniqueID(),
@@ -517,30 +608,34 @@ func (app *Application) Parse() {
 				})
 			}
 
-			if len(playersPos) > 0 {
-				data := FramePositions{
-					app.parser.CurrentFrame(),
-					playersPos,
+			if !app.eliasEncodeDeltas {
+				if len(playersPos) > 0 {
+					data := FramePositions{
+						app.parser.CurrentFrame(),
+						playersPos,
+					}
+
+					model := mongo.NewInsertOneModel().SetDocument(data)
+					app.bulkInserts[ClPositions] = append(app.bulkInserts[ClPositions], model)
+
+					//_, err := app.collections[ClPositions].InsertOne(context.TODO(), data)
+					//checkError(err)
 				}
-
-				model := mongo.NewInsertOneModel().SetDocument(data)
-				app.bulkInserts[ClPositions] = append(app.bulkInserts[ClPositions], model)
-
-				//_, err := app.collections[ClPositions].InsertOne(context.TODO(), data)
-				//checkError(err)
 			}
 
-			if len(grenadesPos) > 0 {
-				data := FrameProjectiles{
-					app.parser.CurrentFrame(),
-					grenadesPos,
+			if !app.eliasEncodeDeltas {
+				if len(grenadesPos) > 0 {
+					data := FrameProjectiles{
+						app.parser.CurrentFrame(),
+						grenadesPos,
+					}
+
+					model := mongo.NewInsertOneModel().SetDocument(data)
+					app.bulkInserts[ClProjectiles] = append(app.bulkInserts[ClProjectiles], model)
+
+					//_, err = app.collections[ClProjectiles].InsertOne(context.TODO(), data)
+					//checkError(err)
 				}
-
-				model := mongo.NewInsertOneModel().SetDocument(data)
-				app.bulkInserts[ClProjectiles] = append(app.bulkInserts[ClProjectiles], model)
-
-				//_, err = app.collections[ClProjectiles].InsertOne(context.TODO(), data)
-				//checkError(err)
 			}
 
 			if len(currentInfernos) > 0 {
@@ -558,11 +653,26 @@ func (app *Application) Parse() {
 		}
 	}
 
+	fmt.Println("Parsing ended")
+
+	for _, v := range app.equipmentElements {
+
+		model := mongo.NewInsertOneModel().SetDocument(v)
+		app.bulkInserts[ClEntities] = append(app.bulkInserts[ClEntities], model)
+
+		//_, err := app.collections[ClEntities].InsertOne(context.TODO(), v)
+		//checkError(err)
+	}
+
 	for _, collectionIndex := range app.collectionsForBulkInserting {
 		data := app.bulkInserts[collectionIndex]
-		fmt.Printf("Length of %s: %d\n", app.collectionNames[collectionIndex], len(data))
-		_, err := app.collections[collectionIndex].BulkWrite(context.TODO(), data)
-		checkError(err)
+		if dbgPrint {
+			fmt.Printf("Length of %s: %d\n", app.collectionNames[collectionIndex], len(data))
+		}
+		if len(data) > 0 {
+			_, err := app.collections[collectionIndex].BulkWrite(context.TODO(), data)
+			checkError(err)
+		}
 	}
 
 }
@@ -589,6 +699,21 @@ func (app *Application) calculateDelta(player *common.Player) PlayerMovementInfo
 		PMI.ViewY = int16(player.ViewDirectionY) - app.playersLastPositions[player.SteamID].ViewY
 	}
 	return PMI
+}
+
+func (app *Application) saveDataToMongo() {
+	for _, collectionIndex := range app.collectionsForBulkInsertingEveryRound {
+		data := app.bulkInserts[collectionIndex]
+		if dbgPrint {
+			fmt.Printf("Length of %s: %d\n", app.collectionNames[collectionIndex], len(data))
+		}
+		if len(data) > 0 {
+			_, err := app.collections[collectionIndex].BulkWrite(context.TODO(), data)
+			checkError(err)
+		}
+		app.bulkInserts[collectionIndex] = nil
+	}
+	//runtime.GC() // doesn't seem to be helpful at all -__-
 }
 
 func checkError(err error) {

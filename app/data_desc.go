@@ -1,6 +1,7 @@
 package app
 
 import (
+	"csgo-parser-mongodb/util"
 	"github.com/golang/geo/r2"
 	"github.com/golang/geo/r3"
 	"github.com/markus-wa/demoinfocs-golang/common"
@@ -38,8 +39,15 @@ func NewInt16Vector2(v r2.Point) Int16Vector2 {
 }
 
 type GrenadePositionInfo struct {
-	UniqueID	int64		`bson:"UniqueID"`
+	UniqueID	int64			`bson:"UniqueID"`
 	Position	Int16Vector3	`bson:"Position"`
+}
+
+type GrenadePositionInfoEncoded struct {
+	UniqueID	int64					`bson:"UniqueID"`
+	PositionX	util.BitArrayWithLength	`bson:"X"`
+	PositionY	util.BitArrayWithLength	`bson:"Y"`
+	PositionZ	util.BitArrayWithLength	`bson:"Z"`
 }
 
 type PlayerMovementInfo struct {
@@ -47,6 +55,29 @@ type PlayerMovementInfo struct {
 	Position	Int16Vector3	`bson:"Position"`
 	ViewX		int16			`bson:"ViewX"`
 	ViewY		int16			`bson:"ViewY"`
+}
+
+type PlayerMovementInfoEncoded struct {
+	SteamID		int64					`bson:"SteamID"`
+	PositionX	util.BitArrayWithLength	`bson:"X"`
+	PositionY	util.BitArrayWithLength	`bson:"Y"`
+	PositionZ	util.BitArrayWithLength	`bson:"Z"`
+	ViewX		util.BitArrayWithLength	`bson:"ViewXArray"`
+	ViewY		util.BitArrayWithLength	`bson:"ViewYArray"`
+}
+
+type PlayerMovement struct {
+	SteamID		int64	`bson:"SteamID"`
+	PositionX	[]int	`bson:"X"`
+	PositionY	[]int	`bson:"Y"`
+	PositionZ	[]int	`bson:"Z"`
+	ViewX		[]int	`bson:"ViewXArray"`
+	ViewY		[]int	`bson:"ViewYArray"`
+}
+
+type RoundMovement struct {
+	RoundNumber		int							`bson:"RoundNumber"`
+	PlayerMovements	[]PlayerMovementInfoEncoded	`bson:"PlayerMovements"`
 }
 
 type PlayerStaticInfo struct {
@@ -92,7 +123,7 @@ type PlayerStateInfo struct {
 	IsAlive					bool					`bson:"IsAlive"`
 	IsBlinded				bool					`bson:"IsBlinded"`
 	Money					int						`bson:"Money"`
-	LastAlivePosition		Int16Vector3				`bson:"LastAlivePosition"`
+	LastAlivePosition		Int16Vector3			`bson:"LastAlivePosition"`
 	Inventory				[]EquipmentInfo			`bson:"Inventory"`
 	AdditionalInfo			AdditionalPlayerInfo	`bson:"AdditionalInfo"`
 }
@@ -150,7 +181,7 @@ type EquipmentInfo struct {
 	OwnerID			int64					`bson:"OwnerID"`
 	//AmmoType		int 					`bson:"AmmoType"`
 	AmmoInMagazine	int 					`bson:"AmmoInMagazine"`
-	AmmoReserve		int 					`bson:"AmmoReserve"`
+	AmmoReserve		int 					`bson:"AmmoReserve"`	// Seems to be 0 all the time for some reason
 	ZoomLevel		int 					`bson:"ZoomLevel"`
 }
 
@@ -189,6 +220,11 @@ type TeamStateInfo struct {
 type InfernoInfo struct {
 	UniqueID		int64		`bson:"UniqueID"`
 	ConvexHull2D	[]r2.Point	`bson:"ConvexHull2D"`
+}
+
+type FlashExplodeInfo struct {
+	UniqueID	int64			`bson:"UniqueID"`
+	Position	Int16Vector3	`bson:"Position"`
 }
 
 type EventInfo struct {
