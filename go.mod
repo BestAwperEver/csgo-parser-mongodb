@@ -4,7 +4,6 @@ go 1.12
 
 require (
 	github.com/go-stack/stack v1.8.0 // indirect
-	github.com/golang-collections/go-datastructures v0.0.0-20150211160725-59788d5eb259
 	github.com/golang/geo v0.0.0-20190507233405-a0e886e97a51
 	github.com/golang/snappy v0.0.1 // indirect
 	github.com/google/go-cmp v0.3.0 // indirect

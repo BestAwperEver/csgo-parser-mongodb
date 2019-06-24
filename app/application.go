@@ -2,7 +2,7 @@ package app
 
 import (
 	"context"
-	"csgo-parser-mongodb/util"
+	"csgo-parser-mongodb/util/elias"
 	"fmt"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/readpref"
@@ -39,7 +39,7 @@ type Application struct {
 	reader io.Reader
 	parser *dem.Parser
 
-	currentProjectiles            map[int]*common.GrenadeProjectile
+	currentProjectiles            map[int64]GrenadeProjectileWithStartFrame
 	equipmentElements             map[int64]EquipmentElementStaticInfo
 	playersLoaded                 bool
 	saveGameStateFrameDenominator int
@@ -54,9 +54,38 @@ type Application struct {
 	playersLastPositions  map[int64]PlayerMovementInfo
 	eliasEncodeDeltas     bool
 
-	grenadesPositionsEncoded []GrenadePositionInfoEncoded
-	playersPositionsInRound  map[int64]*PlayerMovement // had to store pointers because go doesn't allow struct mutation when stored in a map
-	roundNumber              int
+	grenadesPositionsEncoded  []GrenadePositionInfoEncoded
+	playersPositionsInRound   map[int64]*PlayerMovement // had to store pointers because go doesn't allow struct mutation when stored in a map
+	roundNumber               int
+	playerMovementEncodedData RoundMovement
+
+	TerroristsAlive int
+	CTsAlive        int
+
+	playersStats []map[int64]*PlayerRoundStats // [round number][steam id]
+
+	clutchPlayer   *PlayerRoundStats
+	//clutchOpposite *PlayerRoundStats
+	clutchEnemies  []*PlayerRoundStats
+	clutchTeam     common.Team
+	//clutchVs       int
+
+	gameStarted bool
+	openKill    bool // whether there was an open kill in the current round
+	roundEnded  bool
+
+	savedFrameNumber int
+}
+
+func (app *Application) clearPlayersInfo() {
+	app.TerroristsAlive = 5
+	app.CTsAlive = 5
+	app.openKill = false
+	app.clutchTeam = common.TeamUnassigned
+	app.clutchPlayer = nil
+	//app.clutchOpposite = nil
+	//app.clutchVs = 0
+	app.clutchEnemies = make([]*PlayerRoundStats, 0, 5)
 }
 
 // collections' indices
@@ -73,6 +102,8 @@ const (
 	ClReplays
 )
 
+const MAX_ROUNDS = 30
+
 func NewApplication(
 	reader io.Reader,
 	client *mongo.Client,
@@ -81,12 +112,12 @@ func NewApplication(
 	eliasEncoding bool,
 	gameStateFreq int,
 	frameRate int) Application {
-	return Application{
+	return Application {
 		reader:							reader,
 		client:							client,
 		dbName:							dbName,
 		collectionNames:				collectionNames,
-		savePositionsAsDeltas:        	false, // doesn't help in terms of space saving
+		savePositionsAsDeltas:        	false, // doesn't help at all
 		saveGameStateFrameDenominator:	gameStateFreq,
 		frameRate:                    	frameRate,
 		eliasEncodeDeltas:				eliasEncoding,
@@ -98,7 +129,8 @@ func (app *Application) Init() {
 	checkError(err)
 
 	app.equipmentElements = make(map[int64]EquipmentElementStaticInfo)
-	app.currentProjectiles = make(map[int]*common.GrenadeProjectile)
+	//app.currentProjectiles = make(map[int]*common.GrenadeProjectile)
+	app.currentProjectiles = make(map[int64]GrenadeProjectileWithStartFrame)
 	app.collections = make(map[ClIndex]*mongo.Collection)
 
 	app.collections[ClEvents] = app.client.Database(app.dbName).Collection(app.collectionNames[ClEvents])
@@ -134,6 +166,10 @@ func (app *Application) Init() {
 	app.playersLoaded = false
 	app.playersLastPositions = make(map[int64]PlayerMovementInfo)
 	app.playersPositionsInRound = make(map[int64]*PlayerMovement)
+	app.playerMovementEncodedData = RoundMovement{
+		0,
+		make([]PlayerMovementInfoEncoded, 0, 20),
+	}
 
 	// events that are getting processed without dedicated handlers
 	app.implicitlyProcessedEvents = map[EvType]bool {
@@ -141,6 +177,9 @@ func (app *Application) Init() {
 
 		WeaponFire: true,
 		PlayerHurt: true,
+		PlayerJump: true,
+
+		PlayerDisconnected: true, // also manual handling
 
 		BombDefuseStart:   true,
 		BombDefuseAborted: true,
@@ -152,7 +191,8 @@ func (app *Application) Init() {
 		BombPlanted:       true,
 
 		GrenadeProjectileBounce:  true,
-		GrenadeProjectileDestroy: !app.eliasEncodeDeltas,
+		GrenadeProjectileDestroy: true,	// also manual handling
+		GrenadeProjectileThrow: true,	// also manual handling
 
 		HeExplode: true,
 
@@ -169,14 +209,23 @@ func (app *Application) Init() {
 		ItemDrop:   true,
 		ItemEquip:  true,
 
-		PlayerDisconnected: true,
-
 		BotTakenOver: true,
 
 		ScoreUpdated: true,
 
+		RoundFreezetimeEnd: true,
+		RoundMVPReason: true,
+		RoundMVPAnnouncement: true,
+
 		TeamSideSwitch: true,
 	}
+
+	app.gameStarted = false
+	app.roundEnded = true
+
+	app.playersStats = make([]map[int64]*PlayerRoundStats, MAX_ROUNDS)
+
+	app.clearPlayersInfo()
 }
 
 // makes a map from event for persistent saving
@@ -194,25 +243,25 @@ func (app *Application) getMap(event interface{}) map[string]interface{} {
 			switch field.Kind() {
 			case reflect.Ptr:
 				if field.IsNil() == false {
-					switch field := reflect.Indirect(field); field.Type().Name() {
+					switch fieldValue := reflect.Indirect(field); fieldValue.Type().Name() {
 					//default:
 					//	data[reflectedEvent.Type().Field(i).Name] = reflectedEvent.Field(i).Interface()
 					case "Player":
-						P := field.Interface().(common.Player)
+						P := fieldValue.Interface().(common.Player)
 						resultMap[reflectedEvent.Type().Field(i).Name] = P.SteamID
 					case "GrenadeProjectile":
-						GP := field.Interface().(common.GrenadeProjectile)
+						GP := field.Interface().(*common.GrenadeProjectile)
 						if _, ok := app.equipmentElements[GP.UniqueID()]; !ok {
 							app.equipmentElements[GP.UniqueID()] = NewEquipmentElementStaticInfo(GP)
 						}
 						resultMap[reflectedEvent.Type().Field(i).Name] = GP.UniqueID()
 					case "Equipment":
-						Equip := field.Interface().(common.Equipment)
+						Equip := fieldValue.Interface().(common.Equipment)
 						EI := NewEquipmentInfo(Equip)
 						//EI := getMap(Equip)
 						resultMap[reflectedEvent.Type().Field(i).Name] = EI
 					case "TeamState":
-						TS := field.Interface().(common.TeamState)
+						TS := fieldValue.Interface().(common.TeamState)
 						resultMap[reflectedEvent.Type().Field(i).Name] = TeamStateInfo{
 							TS.ID,
 							TS.Score,
@@ -220,10 +269,10 @@ func (app *Application) getMap(event interface{}) map[string]interface{} {
 							TS.Flag,
 						}
 					case "Inferno":
-						INF := field.Interface().(common.Inferno)
+						INF := fieldValue.Interface().(common.Inferno)
 						resultMap[reflectedEvent.Type().Field(i).Name] = INF.UniqueID()
 					case "BombEvent":
-						BE := field.Interface().(events.BombEvent)
+						BE := fieldValue.Interface().(events.BombEvent)
 						resultMap["Player"] = BE.Player.SteamID
 						resultMap["Site"] = BE.Site
 					}
@@ -257,16 +306,151 @@ func (app *Application) getMap(event interface{}) map[string]interface{} {
 	return resultMap
 }
 
+func (app *Application) registerHandlersForStats() {
+
+	app.parser.RegisterEventHandler(func(e events.MatchStart) {
+		app.gameStarted = true
+	})
+
+	//app.parser.RegisterEventHandler(func(e events.PlayerConnect) {
+	//	//Player := app.getPlayerStats(e.Player.SteamID)
+	//	//if _, ok := app.playersStats[app.roundNumber][e.Player.SteamID]; !ok {
+	//	//	app.playersStats[app.roundNumber][e.Player.SteamID] = NewPlayerStats(e.Player.SteamID)
+	//	//}
+	//})
+
+	app.parser.RegisterEventHandler(func(e events.RoundStart) {
+		app.clearPlayersInfo()
+		app.roundEnded = false
+	})
+
+	app.parser.RegisterEventHandler(func(e events.Kill) {
+		if app.gameStarted == false {
+			return
+		}
+		if e.Killer == nil {
+			return
+		}
+		PS := app.getPlayerStats(e.Killer)
+		PS.kills++
+		if e.IsHeadshot {
+			PS.headshots++
+		}
+		if app.openKill == false {
+			PS.openKill = true
+			app.openKill = true
+		}
+
+		if app.clutchTeam == common.TeamUnassigned {
+			aliveTerrorists := app.AliveMembers(common.TeamTerrorists)
+			aliveCounterTerrorists := app.AliveMembers(common.TeamCounterTerrorists)
+			if len(aliveCounterTerrorists) == 1 {
+				app.clutchTeam = common.TeamCounterTerrorists
+				app.clutchPlayer = app.getPlayerStats(aliveCounterTerrorists[0])
+				for _, p := range aliveTerrorists {
+					app.clutchEnemies = append(app.clutchEnemies, app.getPlayerStats(p))
+				}
+			} else if len(aliveTerrorists) == 1 {
+				app.clutchTeam = common.TeamTerrorists
+				app.clutchPlayer = app.getPlayerStats(aliveTerrorists[0])
+				for _, p := range aliveCounterTerrorists {
+					app.clutchEnemies = append(app.clutchEnemies, app.getPlayerStats(p))
+				}
+			}
+		}
+	})
+
+	app.parser.RegisterEventHandler(func(e events.PlayerHurt) {
+		if app.gameStarted == false {
+			return
+		}
+		if e.Attacker == nil {
+			return
+		}
+		Attacker := app.getPlayerStats(e.Attacker)
+		if e.Player.Team == e.Attacker.Team {
+			Attacker.teamDamage += e.HealthDamage
+		} else {
+			Attacker.damage += e.HealthDamage
+			if e.Weapon.Weapon == common.EqHE {
+				Attacker.heDamage += e.HealthDamage
+			}
+		}
+	})
+
+	app.parser.RegisterEventHandler(func(e events.WeaponFire) {
+		if app.gameStarted == false {
+			return
+		}
+		Player := app.getPlayerStats(e.Shooter)
+		Player.weaponFires[e.Weapon.Weapon]++
+	})
+
+	app.parser.RegisterEventHandler(func(e events.PlayerFlashed) {
+		if app.gameStarted == false {
+			return
+		}
+		Attacker := app.getPlayerStats(e.Player)
+		if e.Attacker == e.Player {
+			Attacker.selfFlash += e.FlashDuration()
+		}
+		if e.Attacker.Team == e.Player.Team {
+			Attacker.selfFlash += e.FlashDuration()
+		} else {
+			Attacker.enemyFlash += e.FlashDuration()
+			if 2 * e.FlashDuration() > time.Second {
+				Attacker.enemyFlashed++
+			}
+		}
+	})
+
+	app.parser.RegisterEventHandler(func(e events.RoundEnd) {
+		if app.gameStarted == false {
+			return
+		}
+		// handle current clutch
+		if app.clutchTeam != common.TeamUnassigned {
+			if e.Winner == app.clutchTeam {
+				app.clutchPlayer.clutch[len(app.clutchEnemies)-1] = true
+				for _, p := range app.clutchEnemies {
+					if p != nil {
+						p.clLoose = true
+					}
+				}
+				dbgLog(fmt.Sprintf("%s won a clutch against %d enemies", app.clutchPlayer.Name, len(app.clutchEnemies)))
+			} else if len(app.clutchEnemies) == 1 {
+				app.clutchPlayer.clLoose = true
+				app.clutchEnemies[0].clutch[0] = true
+				dbgLog(fmt.Sprintf("%s won a clutch against %s", app.clutchEnemies[0].Name, app.clutchPlayer.Name))
+			} else {
+				app.clutchEnemies[0].clLoose = true
+				dbgLog(fmt.Sprintf("%s lost a clutch against %d enemies", app.clutchPlayer.Name, len(app.clutchEnemies)))
+			}
+		}
+	})
+}
+
 func (app *Application) manualHandlerRegistering() {
 
+	app.registerHandlersForStats()
+
+	app.parser.RegisterEventHandler(func(e events.ItemPickup) {
+		if _, ok := app.equipmentElements[e.Weapon.UniqueID()]; !ok {
+			app.equipmentElements[e.Weapon.UniqueID()] = NewEquipmentElementStaticInfo(e.Weapon)
+		}
+	})
+
 	app.parser.RegisterEventHandler(func(e events.GrenadeProjectileThrow) {
-		app.currentProjectiles[e.Projectile.EntityID] = e.Projectile
-		app.equipmentElements[e.Projectile.UniqueID()] = NewEquipmentElementStaticInfo(*e.Projectile)
+		app.currentProjectiles[e.Projectile.UniqueID()] = GrenadeProjectileWithStartFrame {
+			app.savedFrameNumber,
+			e.Projectile,
+		}
+		app.equipmentElements[e.Projectile.UniqueID()] = NewEquipmentElementStaticInfo(e.Projectile)
 	})
 
 	app.parser.RegisterEventHandler(func(e events.GameHalfEnded) {
 		var data = EventInfo{
-			app.parser.CurrentFrame(),
+			app.savedFrameNumber,
 			GameHalfEnded,
 			app.getMap(e),
 		}
@@ -278,8 +462,7 @@ func (app *Application) manualHandlerRegistering() {
 		//checkError(err)
 	})
 
-	app.parser.RegisterEventHandler(func(e events.RoundEndOfficial) {
-		app.roundNumber++
+	app.parser.RegisterEventHandler(func(e events.RoundEnd) {
 		//if app.parser.GameState().TeamTerrorists().Score == 15 && e.Winner == common.TeamTerrorists ||
 		//	app.parser.GameState().TeamCounterTerrorists().Score == 15 && e.Winner == common.TeamCounterTerrorists ||
 		//	app.parser.GameState().TotalRoundsPlayed() == 29 {
@@ -293,35 +476,31 @@ func (app *Application) manualHandlerRegistering() {
 		//		//checkError(err)
 		//	}
 		//}
-		if app.eliasEncodeDeltas {
-			data := RoundMovement {
-				app.roundNumber,
-				make([]PlayerMovementInfoEncoded, 0, len(app.playersPositionsInRound)),
-			}
-			for k, v := range app.playersPositionsInRound {
-				data.PlayerMovements = append(data.PlayerMovements, PlayerMovementInfoEncoded {
-					k,
-					util.EliasGammaNegative(util.ArrayToDeltas(v.PositionX)...),
-					util.EliasGammaNegative(util.ArrayToDeltas(v.PositionY)...),
-					util.EliasGammaNegative(util.ArrayToDeltas(v.PositionZ)...),
-					util.EliasGammaNegative(util.ArrayToDeltas(v.ViewX)...),
-					util.EliasGammaNegative(util.ArrayToDeltas(v.ViewY)...),
-				})
-				app.playersPositionsInRound[k].PositionX = app.playersPositionsInRound[k].PositionX[:0]
-				app.playersPositionsInRound[k].PositionY = app.playersPositionsInRound[k].PositionY[:0]
-				app.playersPositionsInRound[k].PositionZ = app.playersPositionsInRound[k].PositionX[:0]
-				app.playersPositionsInRound[k].ViewX = app.playersPositionsInRound[k].PositionX[:0]
-				app.playersPositionsInRound[k].ViewY = app.playersPositionsInRound[k].ViewY[:0]
-			}
-			//app.playersPositionsInRound = make(map[int64]*PlayerMovement)
-			//dataMap := app.getMap(data)
-			model := mongo.NewInsertOneModel().SetDocument(data)
-			app.bulkInserts[ClPositions] = append(app.bulkInserts[ClPositions], model)
-		}
 		fmt.Printf("%d\n", app.roundNumber)
-		app.saveDataToMongo()
 	})
 
+	app.parser.RegisterEventHandler(func(e events.RoundStart){
+		if app.eliasEncodeDeltas {
+			app.playerMovementEncodedData.RoundNumber = app.roundNumber
+
+			for k, v := range app.playersPositionsInRound {
+				if v.StartFrame == 0 {
+					continue // no movement
+				}
+				PMIE := app.encodePlayerMovement(k, v, true)
+				app.playerMovementEncodedData.PlayerMovements = append(app.playerMovementEncodedData.PlayerMovements, PMIE)
+			}
+
+			if len(app.playerMovementEncodedData.PlayerMovements) > 0 {
+				model := mongo.NewInsertOneModel().SetDocument(app.playerMovementEncodedData)
+				app.bulkInserts[ClPositions] = append(app.bulkInserts[ClPositions], model)
+			}
+
+			app.playerMovementEncodedData.PlayerMovements = app.playerMovementEncodedData.PlayerMovements[:0]
+		}
+		app.saveDataToMongo()
+		app.roundNumber++
+	})
 	//app.parser.RegisterEventHandler(func(e events.MatchStartedChanged) {
 	//	if e.NewIsStarted {
 	//		for _, player := range app.parser.GameState().Participants().Playing() {
@@ -337,6 +516,7 @@ func (app *Application) manualHandlerRegistering() {
 	//})
 
 	if app.eliasEncodeDeltas {
+
 		app.parser.RegisterEventHandler(func(e events.GrenadeProjectileDestroy) {
 			X := make([]int, len(e.Projectile.Trajectory))
 			Y := make([]int, len(e.Projectile.Trajectory))
@@ -347,19 +527,37 @@ func (app *Application) manualHandlerRegistering() {
 				Z[i] = int(v.Z)
 			}
 			data := GrenadePositionInfoEncoded {
+				app.currentProjectiles[e.Projectile.UniqueID()].StartFrame,
+				app.savedFrameNumber,
 				e.Projectile.UniqueID(),
-				util.EliasGammaNegative(util.ArrayToDeltas(X)...),
-				util.EliasGammaNegative(util.ArrayToDeltas(Y)...),
-				util.EliasGammaNegative(util.ArrayToDeltas(Z)...),
+				elias.EliasGammaNegative(elias.ArrayToDeltas(X)...),
+				elias.EliasGammaNegative(elias.ArrayToDeltas(Y)...),
+				elias.EliasGammaNegative(elias.ArrayToDeltas(Z)...),
 			}
 			model := mongo.NewInsertOneModel().SetDocument(data)
 			app.bulkInserts[ClProjectiles] = append(app.bulkInserts[ClProjectiles], model)
+		})
+
+		app.parser.RegisterEventHandler(func(e events.PlayerDisconnected) {
+			// player has disconnected and his movement wasn't reset
+			if PM, ok := app.playersPositionsInRound[e.Player.SteamID]; ok && PM.StartFrame != 0 {
+				PM.EndFrame = app.savedFrameNumber
+				app.playerMovementEncodedData.PlayerMovements = append(app.playerMovementEncodedData.PlayerMovements, app.encodePlayerMovement(e.Player.SteamID, PM, true))
+			}
+		})
+
+		app.parser.RegisterEventHandler(func(e events.Kill) {
+			// player was killed and his movement wasn't reset
+			if PM, ok := app.playersPositionsInRound[e.Victim.SteamID]; ok && PM.StartFrame != 0 {
+				PM.EndFrame = app.savedFrameNumber
+				app.playerMovementEncodedData.PlayerMovements = append(app.playerMovementEncodedData.PlayerMovements, app.encodePlayerMovement(e.Victim.SteamID, PM, true))
+			}
 		})
 	}
 
 	app.parser.RegisterEventHandler(func(e events.RankUpdate) {
 		var data = EventInfo{
-			app.parser.CurrentFrame(),
+			app.savedFrameNumber,
 			RankUpdate,
 			app.getMap(e),
 		}
@@ -381,10 +579,10 @@ func (app *Application) manualHandlerRegistering() {
 			EventType   EvType				`bson:"EventType"`
 			Data        FlashExplodeInfo	`bson:"Data"`
 		}{
-			app.parser.CurrentFrame(),
+			app.savedFrameNumber,
 			FlashExplode,
 			FlashExplodeInfo{
-				app.currentProjectiles[e.GrenadeEntityID].UniqueID(),
+				//app.currentProjectiles[e.GrenadeEntityID].UniqueID(), // doesn't matter, it's projectile ID, not item's
 				NewInt16Vector3(e.Position),
 			},
 		}
@@ -401,10 +599,18 @@ func (app *Application) manualHandlerRegistering() {
 			return
 		}
 
-		var data = EventInfo{
-			app.parser.CurrentFrame(),
+		var data = EventInfo {
+			app.savedFrameNumber,
 			Kill,
 			app.getMap(e),
+		}
+
+		if app.eliasEncodeDeltas {
+			if PM, ok := app.playersPositionsInRound[e.Victim.SteamID]; ok && PM.EndFrame == 0 {
+				PM.EndFrame = app.savedFrameNumber
+			} else if !ok { // wtf? kill event with non-existed victim? let's panic!
+				panic("Kill event with non-existing victim")
+			}
 		}
 
 		model := mongo.NewInsertOneModel().SetDocument(data)
@@ -415,18 +621,13 @@ func (app *Application) manualHandlerRegistering() {
 	})
 
 	app.parser.RegisterEventHandler(func(e events.PlayerFlashed) {
-		type PlayerFlashedInfo struct {
-			AttackerID		int64			`bson:"AttackerID"`
-			PlayerID		int64			`bson:"PlayerID"`
-			FlashDuration	time.Duration	`bson:"FlashDuration"`
-		}
 
 		var data = struct {
-			FrameNumber int               `bson:"FrameNumber"`
-			EventType   EvType        `bson:"EventType"`
-			Data        PlayerFlashedInfo `bson:"Data"`
+			FrameNumber int					`bson:"FrameNumber"`
+			EventType   EvType				`bson:"EventType"`
+			Data        PlayerFlashedInfo	`bson:"Data"`
 		}{
-			app.parser.CurrentFrame(),
+			app.savedFrameNumber,
 			PlayerFlashed,
 			PlayerFlashedInfo{
 				e.Attacker.SteamID,
@@ -488,7 +689,7 @@ func (app *Application) Parse() {
 
 		if evType := EvTypeIndex[reflectedEvent.Type().Name()]; app.implicitlyProcessedEvents[evType] {
 			var data = EventInfo {
-				app.parser.CurrentFrame(),
+				app.savedFrameNumber,
 				evType,
 				map[string]interface{}{},
 			}
@@ -519,7 +720,7 @@ func (app *Application) Parse() {
 		//}
 
 		//saving the whole game state
-		if app.parser.CurrentFrame() % app.saveGameStateFrameDenominator == 0 {
+		if app.parser.CurrentFrame() % (app.saveGameStateFrameDenominator * app.savePositionsFrameDenominator) == 0 {
 		//if true {
 			//saving the whole game state
 
@@ -542,7 +743,7 @@ func (app *Application) Parse() {
 			}
 
 			var data = GameStateInfo{
-				app.parser.CurrentFrame(),
+				app.savedFrameNumber,
 				make([]PlayerStateInfo, 0, len(app.parser.GameState().Participants().Playing())),
 			}
 
@@ -557,6 +758,8 @@ func (app *Application) Parse() {
 			//checkError(err)
 		}
 		if app.parser.CurrentFrame() % app.savePositionsFrameDenominator == 0 {
+
+			app.savedFrameNumber++
 
 			playersPos := make([]PlayerMovementInfo, 0, len(app.parser.GameState().Participants().Playing()))
 			grenadesPos := make([]GrenadePositionInfo, 0, len(app.parser.GameState().GrenadeProjectiles()))
@@ -579,9 +782,14 @@ func (app *Application) Parse() {
 						playersPos = append(playersPos, data)
 					} else {
 						PM, ok := app.playersPositionsInRound[v.SteamID]
-						if !ok {
+						if !ok { // player didn't exist; first round or new spawned bot?
 							app.playersPositionsInRound[v.SteamID] = &PlayerMovement{}
 							PM = app.playersPositionsInRound[v.SteamID]
+							PM.StartFrame = app.savedFrameNumber
+						}
+						if PM.StartFrame == 0 {
+							// probably reconnected
+							PM.StartFrame = app.savedFrameNumber
 						}
 						PM.PositionX = append(PM.PositionX, int(v.Position.X))
 						PM.PositionY = append(PM.PositionY, int(v.Position.Y))
@@ -611,7 +819,7 @@ func (app *Application) Parse() {
 			if !app.eliasEncodeDeltas {
 				if len(playersPos) > 0 {
 					data := FramePositions{
-						app.parser.CurrentFrame(),
+						app.savedFrameNumber,
 						playersPos,
 					}
 
@@ -626,7 +834,7 @@ func (app *Application) Parse() {
 			if !app.eliasEncodeDeltas {
 				if len(grenadesPos) > 0 {
 					data := FrameProjectiles{
-						app.parser.CurrentFrame(),
+						app.savedFrameNumber,
 						grenadesPos,
 					}
 
@@ -640,7 +848,7 @@ func (app *Application) Parse() {
 
 			if len(currentInfernos) > 0 {
 				data := FrameInfernos{
-					app.parser.CurrentFrame(),
+					app.savedFrameNumber,
 					currentInfernos,
 				}
 
@@ -704,9 +912,9 @@ func (app *Application) calculateDelta(player *common.Player) PlayerMovementInfo
 func (app *Application) saveDataToMongo() {
 	for _, collectionIndex := range app.collectionsForBulkInsertingEveryRound {
 		data := app.bulkInserts[collectionIndex]
-		if dbgPrint {
-			fmt.Printf("Length of %s: %d\n", app.collectionNames[collectionIndex], len(data))
-		}
+		//if dbgPrint {
+		//	fmt.Printf("Length of %s: %d\n", app.collectionNames[collectionIndex], len(data))
+		//}
 		if len(data) > 0 {
 			_, err := app.collections[collectionIndex].BulkWrite(context.TODO(), data)
 			checkError(err)
@@ -716,8 +924,66 @@ func (app *Application) saveDataToMongo() {
 	//runtime.GC() // doesn't seem to be helpful at all -__-
 }
 
+func (app *Application) encodePlayerMovement(SteamID int64, playerMovement *PlayerMovement, reset bool) PlayerMovementInfoEncoded {
+	PMIE := PlayerMovementInfoEncoded {
+		playerMovement.StartFrame,
+		app.savedFrameNumber,
+		SteamID,
+		elias.EliasGammaNegative(elias.ArrayToDeltas(playerMovement.PositionX)...),
+		elias.EliasGammaNegative(elias.ArrayToDeltas(playerMovement.PositionY)...),
+		elias.EliasGammaNegative(elias.ArrayToDeltas(playerMovement.PositionZ)...),
+		elias.EliasGammaNegative(elias.ArrayToDeltas(playerMovement.ViewX)...),
+		elias.EliasGammaNegative(elias.ArrayToDeltas(playerMovement.ViewY)...),
+	}
+	if playerMovement.EndFrame == 0 { // player didn't get killed or disconnected
+		PMIE.EndFrame = app.savedFrameNumber
+	}
+
+	if reset {
+		// reset movement data
+		//playerMovement.StartFrame = app.savedFrameNumber + 1 // moved to Parse()
+		playerMovement.StartFrame = 0
+		playerMovement.EndFrame = 0
+		playerMovement.PositionX = playerMovement.PositionX[:0]
+		playerMovement.PositionY = playerMovement.PositionY[:0]
+		playerMovement.PositionZ = playerMovement.PositionX[:0]
+		playerMovement.ViewX = playerMovement.PositionX[:0]
+		playerMovement.ViewY = playerMovement.ViewY[:0]
+	}
+
+	return PMIE
+}
+
+func (app *Application) getPlayerStats(player *common.Player) *PlayerRoundStats {
+	if app.playersStats[app.roundNumber-1] == nil {
+		app.playersStats[app.roundNumber-1] = make(map[int64]*PlayerRoundStats)
+	}
+	PS, ok := app.playersStats[app.roundNumber-1][player.SteamID]
+	if !ok {
+		PS = NewPlayerStats(player.SteamID, player.Name)
+		app.playersStats[app.roundNumber-1][player.SteamID] = PS
+	}
+	return PS
+}
+
+func (app *Application) AliveMembers(team common.Team) []*common.Player {
+	res := make([]*common.Player, 0, 5)
+	for _, p := range app.parser.GameState().Participants().TeamMembers(team) {
+		if p.IsAlive() {
+			res = append(res, p)
+		}
+	}
+	return res
+}
+
 func checkError(err error) {
 	if err != nil {
 		panic(err)
+	}
+}
+
+func dbgLog(s string) {
+	if dbgPrint {
+		fmt.Println(s)
 	}
 }

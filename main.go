@@ -27,6 +27,7 @@ func correctFramerate(x int) bool {
 func main() {
 	var pathToDemoFile, mongoUri, dbName string
 	var gameStateFreq, frameRate int
+	var eliasEncoding bool
 
 	flag.StringVar(&pathToDemoFile,"dpath", "none", "Path to the .dem file to parse.")
 	flag.StringVar(&mongoUri, "uri", "localhost:27017", "MongoDB connection URI.")
@@ -35,6 +36,8 @@ func main() {
 	flag.IntVar(&frameRate,"framerate", 32, "Saves players' and grenades' positions with specified framerate. Possible values: 16, 32, 64 or 128. Cannot be greater than demo's original framerate.")
 	flag.IntVar(&gameStateFreq, "gamestate", 32, "Saves a full game state every _ frames.")
 
+	flag.BoolVar(&eliasEncoding, "elias", false, "Saves position and view angle info as Elias Delta code. Greatly diminishes disk space using, but also forces data to be stored in human-unreadable and complicated format with need of decoding later on. Experimental feature.")
+
 	flag.Parse()
 
 	if !correctFramerate(frameRate) {
@@ -42,8 +45,8 @@ func main() {
 	}
 
 	if pathToDemoFile == "none" {
-		//pathToDemoFile = "D:\\Games\\steamapps\\common\\Counter-Strike Global Offensive\\csgo\\replays\\match730_003221901158402490704_1843732364_900.dem"
-		pathToDemoFile = "D:\\Games\\steamapps\\common\\Counter-Strike Global Offensive\\csgo\\replays\\match730_003349388754254037146_0607320178_181.dem"
+		//pathToDemoFile = "D:\\Games\\steamapps\\common\\Counter-Strike Global Offensive\\csgo\\replays\\match730_003221901158402490704_1843732364_900.dem"	// 128 ticks
+		pathToDemoFile = "D:\\Games\\steamapps\\common\\Counter-Strike Global Offensive\\csgo\\replays\\match730_003349388754254037146_0607320178_181.dem"		// 32 ticks
 	}
 
 	mongoUri = "mongodb://" + mongoUri
@@ -55,13 +58,13 @@ func main() {
 	client := connect_to_mongo(mongoUri, 2*time.Second)
 	defer close_connection_to_mongo(client)
 
-	application := app.NewApplication(f, client, dbName, clNames, false, gameStateFreq, frameRate)
+	application := app.NewApplication(f, client, dbName, clNames, eliasEncoding, gameStateFreq, frameRate)
 	application.Init()
 	t1 := time.Now()
 	application.Parse()
 	t2 := time.Now()
 	diff := t2.Sub(t1)
-	fmt.Printf("Parsing process took %f seconds.\n", diff.Seconds())
+	fmt.Printf("Parsing process took %.1f seconds.\n", diff.Seconds())
 }
 
 func checkError(err error) {
